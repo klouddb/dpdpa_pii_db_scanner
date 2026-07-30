@@ -1,0 +1,16 @@
+[[instances]]
+host      = "localhost"
+port      = 5432
+user      = "postgres"
+password  = "yourpassword"
+databases = ["mydb"]
+
+# TLS defaults to "require" when sslmode is omitted.
+# Use "disable" only for trusted local development.
+sslmode = "require"
+
+# For production certificate verification, use:
+# sslmode = "verify-full"
+# sslrootcert = "/path/to/root.crt"
+# sslcert = "/path/to/client.crt"
+# sslkey = "/path/to/client.key"

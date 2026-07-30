@@ -1,0 +1,58 @@
+version: 2
+
+project_name: dpdpascanner
+
+builds:
+  - id: cli
+    main: ./cmd
+    binary: dpdpascanner
+    ldflags:
+      - -s -w
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CGO_ENABLED=0
+
+universal_binaries:
+  - id: cli-universal
+    ids: [cli]
+    replace: true
+
+checksum:
+  name_template: 'checksums.txt'
+
+release:
+  prerelease: auto
+
+archives:
+  - id: cli-archive
+    ids: [cli, cli-universal]
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - conf.example.toml
+      - benchmark/README.md
+      - benchmark/demo_schema.sql
+
+nfpms:
+  - id: packages
+    ids: [cli]
+    file_name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    vendor: KloudDB
+    package_name: dpdpascanner
+    homepage: https://github.com/klouddb/dpdpa_pii_db_scanner
+    maintainer: KloudDB <klouddb@gmail.com>
+    description: India DPDP Act 2023 PII Scanner for PostgreSQL
+    license: BSD 3-Clause
+    formats:
+      - deb
+      - rpm
+    contents:
+      - src: conf.example.toml
+        dst: /etc/dpdpscanner/config.toml
+        type: config
