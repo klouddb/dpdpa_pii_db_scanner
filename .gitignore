@@ -55,15 +55,7 @@ postgresql.conf
 testoutput.log
 
 *.prof
-# Generated benchmark datasets - run gen_large_dataset.py to recreate
-benchmark/india_large.csv
-benchmark/us_large.csv
-benchmark/new_benchmark.csv
 baseline.txt
-benchmark/benchmark
-benchmark/india_benchmark.csv
-
-
 
 .claude/
 

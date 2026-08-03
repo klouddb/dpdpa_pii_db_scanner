@@ -22,20 +22,21 @@ type htmlFinding struct {
 }
 
 type htmlReportData struct {
-	Host            string
-	Database        string
-	ScanType        string
-	TableCount      int
-	DataCount       int
-	MetaCount       int
-	LowDataCount    int
-	LowMetaCount    int
-	DataRows        []htmlFinding
-	MetaRows        []htmlFinding
-	LowDataRows     []htmlFinding
-	LowMetaRows     []htmlFinding
-	HasHighFindings bool
-	HasLowFindings  bool
+	Host               string
+	Database           string
+	ScanType           string
+	TableCount         int
+	DataCount          int
+	MetaCount          int
+	LowDataCount       int
+	LowMetaCount       int
+	DataRows           []htmlFinding
+	MetaRows           []htmlFinding
+	LowDataRows        []htmlFinding
+	LowMetaRows        []htmlFinding
+	HasHighFindings    bool
+	HasLowFindings     bool
+	ShowLowConfidence  bool
 }
 
 func CreateHTMLReport(i *DatabasePIIScanOutput, cnf Config, host string) {
@@ -77,9 +78,10 @@ func buildHTMLData(i *DatabasePIIScanOutput, cnf Config, host string) htmlReport
 	}
 
 	data := htmlReportData{
-		Host:     host,
-		Database: cnf.Database,
-		ScanType: scanType,
+		Host:              host,
+		Database:          cnf.Database,
+		ScanType:          scanType,
+		ShowLowConfidence: cnf.printAllResults,
 	}
 
 	tableSet := make(map[string]bool)
@@ -89,6 +91,11 @@ func buildHTMLData(i *DatabasePIIScanOutput, cnf Config, host string) htmlReport
 
 		for columnName, piidatas := range columns {
 			for _, pii := range piidatas {
+				isHigh := pii.Confidence == "High"
+				if !isHigh && !cnf.printAllResults {
+					continue
+				}
+
 				tableSet[tablename] = true
 
 				matched := ""
@@ -125,7 +132,7 @@ func buildHTMLData(i *DatabasePIIScanOutput, cnf Config, host string) htmlReport
 					BarClass:   barClass,
 				}
 
-				if pii.Confidence == "High" {
+				if isHigh {
 					if pii.DetectorType == DetectorType_ValueDetector {
 						data.DataRows = append(data.DataRows, finding)
 					} else {
@@ -446,6 +453,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
     <div class="stat-label">Meta Findings</div>
     <div class="stat-value">{{.MetaCount}}</div>
   </div>
+  {{if .ShowLowConfidence}}
   <div class="stat-card pii-stat--low-data">
     <div class="stat-label">Low / Medium confidence · Data</div>
     <div class="stat-value">{{.LowDataCount}}</div>
@@ -454,12 +462,15 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
     <div class="stat-label">Low / Medium confidence · Meta</div>
     <div class="stat-value">{{.LowMetaCount}}</div>
   </div>
+  {{end}}
 </div>
 
+{{if .ShowLowConfidence}}
 <div class="pii-tabs">
   <button class="pii-tab active" onclick="switchTab('high', this)">High Confidence</button>
   <button class="pii-tab" onclick="switchTab('low', this)">Low / Medium Confidence</button>
 </div>
+{{end}}
 
 <!-- HIGH CONFIDENCE PANEL -->
 <div id="panel-high" class="pii-tab-panel active">
@@ -553,12 +564,17 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
   <div class="pii-empty-state">
     <div class="pii-empty-icon">&#9671;</div>
     <p class="pii-empty-title">No high-confidence PII found</p>
+    {{if .ShowLowConfidence}}
     <p class="pii-empty-hint">Check the Low / Medium Confidence tab or log files for additional findings.</p>
+    {{else}}
+    <p class="pii-empty-hint">Re-run with <code>--print-all</code> to include low/medium confidence findings.</p>
+    {{end}}
   </div>
   {{end}}
 
 </div>
 
+{{if .ShowLowConfidence}}
 <!-- LOW / MEDIUM CONFIDENCE PANEL -->
 <div id="panel-low" class="pii-tab-panel">
 
@@ -656,6 +672,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
   {{end}}
 
 </div>
+{{end}}
 
 <script>
 (function () {

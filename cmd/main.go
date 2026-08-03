@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"flag"
 	"fmt"
 	"log"
@@ -35,10 +36,6 @@ type AppConfig struct {
 
 const defaultConfigPath = "/etc/dpdpscanner/config.toml"
 
-// defaultScanTimeout caps how long a single database scan may run before
-// being aborted, unless --no-timeout is set. It's referenced directly by
-// the --no-timeout flag's help text and by the timeout-suggestion message
-// below, so both stay in sync automatically if this value ever changes.
 const defaultScanTimeout = 5 * time.Minute
 
 func resolveConfigPath(configDir string) (string, error) {
@@ -53,7 +50,7 @@ func resolveConfigPath(configDir string) (string, error) {
 		return defaultConfigPath, nil
 	}
 
-	return "", fmt.Errorf("config.toml not found in current directory or %s; use --config to specify its location", defaultConfigPath)
+	return "", fmt.Errorf("config.toml not found in current directory or %s; use --config to specify its location, or pass a postgres:// URI", defaultConfigPath)
 }
 
 func fileExists(path string) bool {
@@ -69,7 +66,7 @@ func main() {
 	excludeTable := flag.String("exclude-table", "", "comma-separated list of tables to exclude")
 	includeTable := flag.String("include-table", "", "comma-separated list of tables to include")
 	targetHost := flag.String("target-host", "", "scan only this host (leave empty to scan all)")
-	printAll := flag.Bool("print-all", false, "print all confidence levels in terminal")
+	printAll := flag.Bool("print-all", false, "include low/medium confidence results in terminal, log files, and HTML report (default: high confidence only)")
 	printSummary := flag.Bool("print-summary", false, "print summary only")
 	noTimeout := flag.Bool("no-timeout", false, fmt.Sprintf("disable the %s per-database scan timeout, useful for very large databases that need more time", defaultScanTimeout))
 	flag.Parse()
@@ -82,6 +79,30 @@ func main() {
 		opts := piiscanner.RunOptionSlice()
 		sort.Strings(opts)
 		log.Fatalf("Invalid --piiscanner value: %q. Must be one of: %s", *runOption, strings.Join(opts, ", "))
+	}
+
+	args := flag.Args()
+	if len(args) > 1 {
+		log.Fatalf("unexpected arguments: %v", args)
+	}
+
+	// Optional: postgres://... as a CLI string (not stored). Skips config.toml.
+	if len(args) == 1 {
+		uri := args[0]
+		if !postgresdb.IsConnectionURI(uri) {
+			log.Fatalf("unexpected argument %q (expected postgres:// URI or no args for config.toml)", uri)
+		}
+		if *configDir != "" || *dbFilter != "" || *targetHost != "" {
+			log.Fatal("with a postgres:// URI do not use --config, --database, or --target-host")
+		}
+
+		store, host, database, err := postgresdb.OpenURI(uri)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("\n=== Scanning %s / %s ===\n", host, database)
+		runScan(store, &postgresdb.Postgres{Host: host, DBName: database}, database, *runOption, *excludeTable, *includeTable, *schema, *printAll, *printSummary, *noTimeout)
+		return
 	}
 
 	configPath, err := resolveConfigPath(*configDir)
@@ -145,50 +166,52 @@ func main() {
 				log.Printf("  [SKIP] Could not connect: %v", err)
 				continue
 			}
-
-			cnf, err := piiscanner.NewConfig(&pgConf, *runOption, *excludeTable, *includeTable, database, *schema, *printAll, false, *printSummary)
-			if err != nil {
-				store.Close()
-				log.Printf("  [SKIP] Config error: %v", err)
-				continue
-			}
-
-			helper := piiscanner.NewPostgresDBHelper(cnf.Schema)
-			scanner := piiscanner.NewDatabasePiiScanner(helper, store, cnf)
-
-			var ctx context.Context
-			var cancel context.CancelFunc
-			if *noTimeout {
-				ctx, cancel = context.Background(), func() {}
-			} else {
-				ctx, cancel = context.WithTimeout(context.Background(), defaultScanTimeout)
-			}
-			err = scanner.Scan(ctx)
-			cancel()
-			store.Close()
-
-			if err != nil {
-				scanner.Close()
-				log.Printf("  [SKIP] Scan error: %v", err)
-				if ctx.Err() == context.DeadlineExceeded {
-					log.Printf("  Scan of %s stopped after the %s timeout — re-run with --no-timeout to let it finish without a time limit.", database, defaultScanTimeout)
-				}
-				continue
-			}
-
-			output, err := scanner.GetResults()
-			if err != nil || output == nil {
-				log.Printf("  [SKIP] No results returned")
-				continue
-			}
-
-			piiscanner.PrintTerminalOutput(output, *cnf)
-			piiscanner.CreateTabularOutputfile(output, *cnf)
-			piiscanner.CreateHTMLReport(output, *cnf, inst.Host)
+			runScan(store, &pgConf, database, *runOption, *excludeTable, *includeTable, *schema, *printAll, *printSummary, *noTimeout)
 		}
-
 	}
 	if *dbFilter != "" && !dbMatched {
 		log.Fatalf("database %q not found in config.toml", *dbFilter)
 	}
+}
+
+func runScan(store *sql.DB, pgConf *postgresdb.Postgres, database, runOption, excludeTable, includeTable, schema string, printAll, printSummary, noTimeout bool) {
+	defer store.Close()
+
+	cnf, err := piiscanner.NewConfig(pgConf, runOption, excludeTable, includeTable, database, schema, printAll, false, printSummary)
+	if err != nil {
+		log.Printf("  [SKIP] Config error: %v", err)
+		return
+	}
+
+	helper := piiscanner.NewPostgresDBHelper(cnf.Schema)
+	scanner := piiscanner.NewDatabasePiiScanner(helper, store, cnf)
+
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if noTimeout {
+		ctx, cancel = context.Background(), func() {}
+	} else {
+		ctx, cancel = context.WithTimeout(context.Background(), defaultScanTimeout)
+	}
+	err = scanner.Scan(ctx)
+	cancel()
+
+	if err != nil {
+		scanner.Close()
+		log.Printf("  [SKIP] Scan error: %v", err)
+		if ctx.Err() == context.DeadlineExceeded {
+			log.Printf("  Scan of %s stopped after the %s timeout — re-run with --no-timeout to let it finish without a time limit.", database, defaultScanTimeout)
+		}
+		return
+	}
+
+	output, err := scanner.GetResults()
+	if err != nil || output == nil {
+		log.Printf("  [SKIP] No results returned")
+		return
+	}
+
+	piiscanner.PrintTerminalOutput(output, *cnf)
+	piiscanner.CreateTabularOutputfile(output, *cnf)
+	piiscanner.CreateHTMLReport(output, *cnf, pgConf.Host)
 }

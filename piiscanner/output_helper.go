@@ -42,6 +42,17 @@ func CreateTabularOutputfile(i *DatabasePIIScanOutput, cnf Config) {
 	}
 	defer highConfidenceFile.Close()
 
+	GenerateTabularOutput(highConfidenceFile, i, cnf, "High")
+
+	HighConfidenceFilePath, _ := filepath.Abs(highConfidenceFile.Name())
+	fmt.Println("> High confidence log file created at: [ " + HighConfidenceFilePath + " ]")
+
+	// Low/medium confidence is suppressed by default to reduce noise.
+	// Pass --print-all to also write the low-confidence log.
+	if !cnf.printAllResults {
+		return
+	}
+
 	lowConfidenceFile, err := os.Create("kshield_pii_lowconfidence.log")
 	if err != nil {
 		fmt.Println("Error creating low confidence log file: ", text.FgRed.Sprint(err))
@@ -49,13 +60,9 @@ func CreateTabularOutputfile(i *DatabasePIIScanOutput, cnf Config) {
 	}
 	defer lowConfidenceFile.Close()
 
-	GenerateTabularOutput(highConfidenceFile, i, cnf, "High")
 	GenerateTabularOutput(lowConfidenceFile, i, cnf, "Medium|Low")
 
 	lowConfidenceFilePath, _ := filepath.Abs(lowConfidenceFile.Name())
-	HighConfidenceFilePath, _ := filepath.Abs(highConfidenceFile.Name())
-
-	fmt.Println("> High confidence log file created at: [ " + HighConfidenceFilePath + " ]")
 	fmt.Println("> Low confidence log file created at: [ " + lowConfidenceFilePath + " ]")
 }
 
@@ -138,23 +145,21 @@ func GenerateTabularOutput(w io.Writer, i *DatabasePIIScanOutput, cnf Config, fi
 		fmt.Fprintln(w, "> No PII data found in database")
 
 	case tableShowingInTopTable.Len() == 0 && tablesWithPIIData.Len() != 0:
-		fmt.Fprintln(w, "> We have displayed only high-confidence entities in the list above. In addition to these PII entities, we also identified some low-confidence entities in the following tables:")
+		fmt.Fprintln(w, "> No high-confidence PII entities were found. Some low/medium-confidence entities were identified in the following tables:")
 		fmt.Fprintln(w, text.FgHiRed.Sprint(utils.AraryToHumanReadableString(tablesWithPIIData.Slice())))
-		fmt.Fprintln(w, "Please check detailed log file or html file for additional data")
+		fmt.Fprintln(w, "Re-run with --print-all to include low/medium confidence results in the terminal, log files, and HTML report.")
 
 	case tableShowingInTopTable.Len() != 0 && tablesWithPIIData.Len() != 0 && tableShowingInTopTable.Len() == tablesWithPIIData.Len():
 		if cnf.printAllResults {
-			fmt.Fprintln(w, "> We have displayed only high-confidence entities in the list above.")
+			fmt.Fprintln(w, "> All confidence levels are shown above (--print-all).")
 		} else {
-			fmt.Fprintln(w, "> We have displayed only high-confidence entities in the list above. In addition to these PII entities, we also identified some low-confidence entities.")
-			fmt.Fprintln(w, "Please check detailed log file or html file for additional data.")
-
+			fmt.Fprintln(w, "> Showing high-confidence entities only. Re-run with --print-all to also include low/medium confidence results.")
 		}
 
 	case tableShowingInTopTable.Len() != 0 && tablesWithPIIData.Len() != 0 && tableShowingInTopTable.Len() != tablesWithPIIData.Len():
-		fmt.Fprintln(w, "> We have displayed only high-confidence entities in the list above. In addition to these PII entities, we also identified some low-confidence entities in the following tables:")
+		fmt.Fprintln(w, "> Showing high-confidence entities only. Some low/medium-confidence entities were also identified in the following tables:")
 		fmt.Fprintln(w, text.FgHiRed.Sprint(utils.AraryToHumanReadableString(tablesWithPIIData.Slice())))
-		fmt.Fprintln(w, "Please check detailed log file or html file for additional data.")
+		fmt.Fprintln(w, "Re-run with --print-all to include low/medium confidence results in the terminal, log files, and HTML report.")
 	}
 
 	fmt.Fprintln(w, "")
@@ -204,37 +209,5 @@ func printTerminalOutputSimple(i *DatabasePIIScanOutput) {
 	}
 	fmt.Println()
 
-	lowConfidenceTables := []string{}
-	totalTables := 0
-	for tablename, confidences := range m {
-		if len(confidences) != 0 {
-			totalTables++
-		}
-		addTable := true
-		var columns int
-		for v := range confidences {
-			if v == "High" {
-				addTable = false
-				break
-			}
-			for _, c := range confidences[v] {
-				columns += len(c)
-			}
-		}
-
-		if addTable && columns > 0 {
-			tablename = text.FgHiBlue.Sprintf("%s (%d column)", tablename, columns)
-			lowConfidenceTables = append(lowConfidenceTables, tablename)
-		}
-	}
-
-	if len(lowConfidenceTables) > 0 {
-		tables := strings.Join(lowConfidenceTables, "\n-> ")
-		// tables = text.FgHiRed.Sprint(tables)
-		fmt.Printf("There are total %s tables with pii data in your database. here are some with low confidence: \n-> %s\n",
-			text.FgHiRed.Sprint(totalTables), tables)
-		fmt.Println()
-	}
-
-	fmt.Println("For more details, please use the detailed output option")
+	fmt.Println("Showing high-confidence summary only. Re-run with --print-all (without --print-summary) for low/medium confidence details.")
 }

@@ -36,8 +36,6 @@ archives:
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - conf.example.toml
-      - benchmark/README.md
-      - benchmark/demo_schema.sql
 
 nfpms:
   - id: packages
