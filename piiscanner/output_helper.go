@@ -149,13 +149,6 @@ func GenerateTabularOutput(w io.Writer, i *DatabasePIIScanOutput, cnf Config, fi
 		fmt.Fprintln(w, text.FgHiRed.Sprint(utils.AraryToHumanReadableString(tablesWithPIIData.Slice())))
 		fmt.Fprintln(w, "Re-run with --print-all to include low/medium confidence results in the terminal, log files, and HTML report.")
 
-	case tableShowingInTopTable.Len() != 0 && tablesWithPIIData.Len() != 0 && tableShowingInTopTable.Len() == tablesWithPIIData.Len():
-		if cnf.printAllResults {
-			fmt.Fprintln(w, "> All confidence levels are shown above (--print-all).")
-		} else {
-			fmt.Fprintln(w, "> Showing high-confidence entities only. Re-run with --print-all to also include low/medium confidence results.")
-		}
-
 	case tableShowingInTopTable.Len() != 0 && tablesWithPIIData.Len() != 0 && tableShowingInTopTable.Len() != tablesWithPIIData.Len():
 		fmt.Fprintln(w, "> Showing high-confidence entities only. Some low/medium-confidence entities were also identified in the following tables:")
 		fmt.Fprintln(w, text.FgHiRed.Sprint(utils.AraryToHumanReadableString(tablesWithPIIData.Slice())))
