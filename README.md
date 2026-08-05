@@ -6,7 +6,7 @@
 
 A command-line **PII (Personally Identifiable Information) scanner** for PostgreSQL databases, built for compliance with **India's Digital Personal Data Protection (DPDP) Act**.
 
-### IMPORTANT NOTE - Use this together with KloudDB Shield (https://github.com/klouddb/klouddbshield) to strengthen your PostgreSQL security posture 
+### Important Note - Use this together with KloudDB Shield (https://github.com/klouddb/klouddbshield) to strengthen your PostgreSQL security posture 
 
 ## What It Does
 
