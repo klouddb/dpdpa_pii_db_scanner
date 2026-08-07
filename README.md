@@ -60,7 +60,7 @@ Ensure you have [Go](https://go.dev/dl/) installed, then run:
 
 ```bash
 git clone https://github.com/klouddb/dpdpa_pii_db_scanner.git
-cd DPA_private
+cd dpdpa_pii_db_scanner
 go build -o dpdpascanner ./cmd/
 ```
 
