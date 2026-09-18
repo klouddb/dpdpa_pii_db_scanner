@@ -40,14 +40,14 @@ func TestBuildHTMLData_SuppressesLowConfidenceByDefault(t *testing.T) {
 	}
 
 	tests := []struct {
-		name              string
-		printAll          bool
-		wantHighData      int
-		wantHighMeta      int
-		wantLowData       int
-		wantLowMeta       int
-		wantShowLow       bool
-		wantTableCount    int
+		name           string
+		printAll       bool
+		wantHighData   int
+		wantHighMeta   int
+		wantLowData    int
+		wantLowMeta    int
+		wantShowLow    bool
+		wantTableCount int
 	}{
 		{
 			name:           "default suppresses low and medium",
@@ -77,7 +77,7 @@ func TestBuildHTMLData_SuppressesLowConfidenceByDefault(t *testing.T) {
 				Database:        "testdb",
 				printAllResults: tt.printAll,
 			}
-			got := buildHTMLData(output, cnf, "localhost")
+			got := buildHTMLData(output, cnf, "localhost", "Postgres")
 			if got.ShowLowConfidence != tt.wantShowLow {
 				t.Fatalf("ShowLowConfidence = %v, want %v", got.ShowLowConfidence, tt.wantShowLow)
 			}
@@ -123,10 +123,10 @@ func TestCreateTabularOutputfile_SuppressesLowConfidenceByDefault(t *testing.T) 
 	}
 
 	tests := []struct {
-		name           string
-		printAll       bool
-		wantHighLog    bool
-		wantLowLog     bool
+		name        string
+		printAll    bool
+		wantHighLog bool
+		wantLowLog  bool
 	}{
 		{
 			name:        "default writes high log only",
@@ -156,8 +156,8 @@ func TestCreateTabularOutputfile_SuppressesLowConfidenceByDefault(t *testing.T) 
 				_ = os.Chdir(cwd)
 			})
 
-			cnf := Config{printAllResults: tt.printAll}
-			CreateTabularOutputfile(output, cnf)
+			opts := OutputOptions{PrintAllResults: tt.printAll}
+			CreateTabularOutputfile(output, opts, dir)
 
 			highPath := filepath.Join(dir, "kshield_pii_highconfidence.log")
 			lowPath := filepath.Join(dir, "kshield_pii_lowconfidence.log")

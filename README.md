@@ -1,63 +1,31 @@
-# DPDPAScanner — India DPDP Act PII Scanner
+# dpdpascanner — DPDP Act PII Scanner
 
-[![Go Build](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/release.yml/badge.svg)](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/release.yml) [![Go Lint](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/golangci.yml/badge.svg)](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/golangci.yml) [![Golang Vulnerability Check](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/govulncheck.yml/badge.svg)](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/govulncheck.yml)
+[![Go Build](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/release.yml/badge.svg)](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/release.yml) [![Go Lint](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/golangci.yml/badge.svg)](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/golangci.yml) [![Govulncheck](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/govulncheck.yml/badge.svg)](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/govulncheck.yml)
 
-# DPDPA PII Scanner for PostgreSQL
+A command-line PII scanner built for compliance with India's **Digital Personal Data Protection (DPDP) Act 2023**.
 
-A command-line **PII (Personally Identifiable Information) scanner** for PostgreSQL databases, built for compliance with **India's Digital Personal Data Protection (DPDP) Act**.
+Point it at a database — PostgreSQL, MySQL, SQL Server, MongoDB, or Redis — and it scans every table (or collection/key) for sensitive data: Aadhaar, PAN, GSTIN, bank accounts, credit cards, passports, UPI IDs, and 40+ other entity types. Results show up in your terminal, in log files, and in a self-contained HTML report.
 
-### Important Note 
-Use this together with KloudDB Shield (https://github.com/klouddb/klouddbshield) to strengthen your PostgreSQL security posture 
+## What you get
 
-## What It Does
+- **Terminal output** — high-confidence findings by default; add `--print-all` for medium/low confidence too
+- **HTML report** (`kshield_pii_report.html`) — same findings, browsable, no internet needed to open it
+- **Log files** — `kshield_pii_highconfidence.log` always; `kshield_pii_lowconfidence.log` with `--print-all`
+- **Multi-instance scanning** — any mix of servers, engines, and databases in one run via `config.toml`
+- **Incremental scans** — re-run later and only scan what's new or under-scanned (`--incremental`)
 
-Point it at one or more PostgreSQL servers, and it scans **every table** for sensitive data, including:
-| **Category**          | **Entities**                                                                                      |
-| --------------------- | ------------------------------------------------------------------------------------------------- |
-| **Identity**          | Name, Gender, Nationality, Username                                                               |
-| **Contact**           | Email, Phone, Address, Location                                                                   |
-| **Government ID**     | Aadhaar, PAN, Passport, Voter ID, Driving Licence, Ration Card                                    |
-| **Financial**         | Credit Card, CVV, Bank Account, Demat Account, UPI ID, IFSC, MICR Code, Cheque Number, CIF Number |
-| **Tax & Corporate**   | GSTIN, TAN, CIN, SEBI Registration                                                                |
-| **Employment**        | UAN, EPF Member ID, ESIC                                                                          |
-| **Healthcare**        | ABHA Number                                                                                       |
-| **Transport**         | Vehicle Number, FASTag ID                                                                         |
-| **Loans & Insurance** | Loan Account Number, Insurance Policy Number                                                      |
-| **Network**           | IP Address, MAC Address                                                                           |
-| **Authentication**    | Password, OAuth Token                                                                             |
-| **Date**              | Birth Date                                                                                        |
+Each table is scanned two ways: a **meta scan** (column names only, e.g. a column called `aadhaar_number`) and a **data scan** (actual values checked against 40+ regex patterns). By default the scanner picks the right depth automatically per table — see [Scan modes](#scan-modes) below.
 
-## Output Formats
+## Prerequisites
 
-Results are delivered three ways:
+- Go 1.26 or newer (to build)
+- Git
+- One of: PostgreSQL, MySQL, SQL Server, MongoDB, or Redis
+- Optional, only for `--piiscanner spacyscan`: Python 3 with spaCy installed
 
-| Format | Description |
-|--------|-------------|
-| 🖥️ **Terminal** | Instant results right in your console |
-| 📄 **Log Files** | Persistent logs for audits and records |
-| 🌐 **HTML Report** | A self-contained report you can open in any browser |
+## Getting started
 
-## Install and Configure
-
-## Installation
-
-### Method 1: Install from Pre-built Packages (Recommended)
-
-Download the appropriate package for your operating system from the [Releases](https://github.com/klouddb/dpdpa_pii_db_scanner/releases/) page and install it using your system's package manager.
-
-**CentOS / RHEL / Fedora:**
-```bash
-sudo rpm -i dpdpa_pii_db_scanner-<version>.rpm
-```
-
-**Ubuntu / Debian:**
-```bash
-sudo dpkg -i dpdpa_pii_db_scanner-<version>.deb
-```
-
-### Method 2: Build from Source
-
-Ensure you have [Go](https://go.dev/dl/) installed, then run:
+**1. Clone and build**
 
 ```bash
 git clone https://github.com/klouddb/dpdpa_pii_db_scanner.git
@@ -65,79 +33,277 @@ cd dpdpa_pii_db_scanner
 go build -o dpdpascanner ./cmd/
 ```
 
-This will produce a `dpdpascanner` binary in the current directory.
-##  Run a Scan
+This produces a single `dpdpascanner` binary. Rebuild only when the code changes.
 
+**2. Configure**
 
-### Run without config.toml
+Copy `conf.example.toml` to `config.toml` and edit it, or skip this step entirely and pass a connection URI on the command line (Postgres only — see below).
 
-Pass a PostgreSQL connection URI as the first argument — no need to edit `dbname` in a config file each time:
+`config.toml` is gitignored, so credentials never get committed.
 
-```bash
-dpdpascanner postgres://user:pass@localhost:5432/mydb?sslmode=disable
-```
-
-Always make sure your connection is secure when connecting to a database over a network you don't fully trust. Prefer SSH, a VPN, or `sslmode=verify-full`. If your connection doesn't use SSL, append `?sslmode=disable` (local development only).
-
-Other flags still work with a URI (`--piiscanner`, `--schema`, `--include-table`, `--print-all`, etc.). Do not combine a URI with `--config`, `--database`, or `--target-host`.
-
-**Scan a specific database (from config.toml):**
-```bash
-dpdpascanner -database sales_db
-```
-
-**config file:**
-
-Once you install package you need to setup config.toml under /etc/dpdpscanner
-
-```
+```toml
 [[instances]]
 host      = "localhost"
 port      = 5432
 user      = "postgres"
 password  = "your_password_here"
 databases = ["my_database"]
+sslmode   = "require"   # "disable" only for trusted local dev
 ```
-## Scan Types Explained
 
-These are the values you can pass to `--piiscanner` when you want to force the same scan type on every table, instead of the automatic per-table behavior described above.
+Add an `engine` field for anything other than Postgres:
 
-### `datascan`
-Always reads actual data from your database columns, using a random sample — approximately 10% of rows, up to 10,000 rows per table — regardless of table size.
+```toml
+[[instances]]
+engine    = "mysql"        # mysql | sqlserver | mongodb | redis
+host      = "localhost"
+port      = 3306
+user      = "mysql_user"
+password  = "your_password_here"
+databases = ["my_database"]
+```
 
-- **Best for:** consistently fast scans across every table, when you're fine with sampling even on small tables
-- **How it works:** scans sampled values and matches them against 40+ regex patterns
-- **Note:** on small tables (under 10,000 rows) the scanner will print a warning that sampling may miss results, and suggests you omit `--piiscanner` (to get the automatic behavior above) or use `--piiscanner deepscan` instead
-- **Output:** Data Scan Report + Meta Scan Report
+MongoDB uses a `uri` instead of host/port/user/password, and Redis uses `redis_dbs` (a list of numbered databases) instead of `databases`. See `conf.example.toml` for a worked example of every engine, including TLS options for production/RDS-style setups.
 
-### `metascan`
-Only looks at column names — does **not** read any actual data from the database.
+**3. Run it**
 
-- **Best for:** the fastest possible scan, or environments where you're not allowed to read row data at all
-- **How it works:** matches column names against known PII naming patterns
-- **Output:** Meta Scan Report only
+```bash
+./dpdpascanner
+```
 
-### `deepscan`
-Reads **every row** of every table, no sampling, no limit.
+With no flags, this scans everything in `config.toml` using the recommended automatic depth. That's the right first command to run.
 
-- **Best for:** a thorough, complete scan when you have the time to wait, especially on smaller databases
-- **Note:** can be slow on large tables. If a table has more than 100,000 rows, the scanner will pause and ask you to confirm before reading it (`yes` / `no` / `yes to all`), so a huge table can't accidentally lock up your terminal for hours without warning
-- **Output:** Data Scan Report + Meta Scan Report
+## Common flags
+
+| Flag                                  | Default                                 | What it does                                                                    |
+| ------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------- |
+| `--config`                            | current directory                       | Folder containing `config.toml`                                                 |
+| `--engine`                            | _(all engines)_                         | Scan only one engine: `postgres`, `mysql`, `mongodb`, `sqlserver`, `redis`      |
+| `--database`                          | _(all databases)_                       | Scan only this one database                                                     |
+| `--target-host`                       | _(all hosts)_                           | Scan only this server                                                           |
+| `--schema`                            | `public` (Postgres), `dbo` (SQL Server) | Schema to scan; ignored by MySQL/MongoDB/Redis                                  |
+| `--include-table` / `--exclude-table` | _(none)_                                | Comma-separated table allow/deny list                                           |
+| `--piiscanner`                        | _(not set — see below)_                 | Force one mode everywhere: `datascan`, `metascan`, `deepscan`, `spacyscan`      |
+| `--print-all`                         | `false`                                 | Include medium/low confidence findings, not just high                           |
+| `--print-summary`                     | `false`                                 | Print a condensed summary instead of full tables                                |
+| `--incremental`                       | `false`                                 | Skip tables/columns already scanned deeply enough in a previous run             |
+| `--reset-incremental`                 | `false`                                 | Delete saved incremental state and exit                                         |
+| `--no-timeout`                        | `false`                                 | Disable the default per-database scan timeout (useful for very large databases) |
+| `--version`                           | —                                       | Print version and exit                                                          |
+
+Instead of `--config`/`--database`/`--target-host`, you can pass a Postgres connection URI directly:
+
+```bash
+./dpdpascanner "postgres://user:pass@localhost:5432/mydb?sslmode=disable"
+```
+
+## Scan modes
+
+- **Default (no `--piiscanner` flag)** — small tables (under 10,000 rows) get a full deep scan; large tables get a fast ~10% sample. This is the recommended way to run the scanner day to day.
+- **`datascan`** — always samples ~10% of rows (up to 10,000), regardless of table size. Fast, but can miss rare values on small tables.
+- **`metascan`** — column names only, no data ever read. Fastest option, and useful where you're not allowed to read row values at all.
+- **`deepscan`** — every row, no sampling. Thorough but slow on large tables; scanning a table over 100,000 rows will ask for confirmation first.
+- **`spacyscan`** — runs a spaCy NER model against columns already flagged as Name/Address, to double-check those specific findings. See below.
+
+## Incremental scanning
+
+Pass `--incremental` and the scanner remembers what it already covered, per host and database, in JSON files under `scan_state/`. On the next run it skips anything already scanned at sufficient depth (a prior deep scan satisfies a later data scan request) and only looks at new or shallower tables. Run `--reset-incremental` to wipe that state and start fresh. It doesn't apply to `metascan`, `spacyscan`, or Redis (which always does a full scan).
+
+## Understanding the output
+
+**Terminal** — a live progress view per table, followed by a findings table:
+
+```
+=== Scanning localhost:5432 / sales_db ===
+> Found 12 tables
+> Started table scan manager with 8 runners
+
+Data Scan Report
++----------------+----------+-------+------------+----------+---------+
+| TABLE          | COLUMN   | LABEL | CONFIDENCE | DETECTOR | MATCHED |
++----------------+----------+-------+------------+----------+---------+
+| public.users   | email    | Email | High 🔴    | regex    | 101/101 |
++----------------+----------+-------+------------+----------+---------+
+
+Meta Scan Report
++----------------+----------+----------+------------+
+| TABLE          | COLUMN   | LABEL    | CONFIDENCE |
++----------------+----------+----------+------------+
+| public.users   | dob      | BirthDate| High 🔴    |
++----------------+----------+----------+------------+
+
+> High confidence log file created at: [ /path/to/kshield_pii_highconfidence.log ]
+> HTML report created at: [ /path/to/kshield_pii_report.html ]
+```
+
+With `--print-all`, the low-confidence log line is also printed. If nothing was found at all, you'll simply see `> No PII data found in database`.
+
+**HTML report** (`kshield_pii_report.html`) — summary cards, findings tables, and colour-coded PII labels. It's overwritten on every run, so if you're scanning several databases in one go and want to keep a report per database, scan them one at a time with `--database`.
+
+**Log files** — `kshield_pii_highconfidence.log` and (with `--print-all`) `kshield_pii_lowconfidence.log`, written to the folder you ran the scanner from.
+
+## PII entities detected (40+)
+
+| Category          | Entities                                                                                          |
+| ----------------- | ------------------------------------------------------------------------------------------------- |
+| Identity          | Name, Gender, Nationality, Username                                                               |
+| Contact           | Email, Phone, Address, Location                                                                   |
+| Government ID     | Aadhaar, PAN, Passport, Voter ID, Driving Licence, Ration Card                                    |
+| Financial         | Credit Card, CVV, Bank Account, Demat Account, UPI ID, IFSC, MICR Code, Cheque Number, CIF Number |
+| Tax & Corporate   | GSTIN, TAN, CIN, SEBI Registration                                                                |
+| Employment        | UAN, EPF Member ID, ESIC                                                                          |
+| Healthcare        | ABHA Number                                                                                       |
+| Transport         | Vehicle Number, FASTag ID                                                                         |
+| Loans & Insurance | Loan Account Number, Insurance Policy Number                                                      |
+| Network           | IP Address, MAC Address                                                                           |
+| Auth              | Password, OAuth Token                                                                             |
+| Date              | Birth Date                                                                                        |
+
+## Example usage scenarios
+
+**First run — scan everything in config.toml:**
+
+```bash
+./dpdpascanner
+```
+
+**Scan only one database on one server:**
+
+```bash
+./dpdpascanner --target-host localhost --database hr_db
+```
+
+**Scan only one engine, across all its instances:**
+
+```bash
+./dpdpascanner --engine mongodb
+```
+
+**Force a full, no-sampling scan of one database:**
+
+```bash
+./dpdpascanner --database hr_db --piiscanner deepscan
+```
+
+**Quick scan using column names only, no data read at all:**
+
+```bash
+./dpdpascanner --piiscanner metascan --database sales_db
+```
+
+**Skip audit and temp tables:**
+
+```bash
+./dpdpascanner --exclude-table audit_logs,temp_sessions,migrations
+```
+
+**Scan only specific tables:**
+
+```bash
+./dpdpascanner --include-table users,customers,employees
+```
+
+**See all confidence levels, not just high:**
+
+```bash
+./dpdpascanner --print-all --database hr_db
+```
+
+**Scan with a Postgres connection URI, no config.toml:**
+
+```bash
+./dpdpascanner "postgres://postgres:password@localhost:5432/hr_db?sslmode=disable"
+```
+
+**Re-run later and only pick up what's changed:**
+
+```bash
+./dpdpascanner --incremental
+```
+
+**Start incremental tracking over from scratch:**
+
+```bash
+./dpdpascanner --reset-incremental
+```
+
+**Non-default schema:**
+
+```bash
+./dpdpascanner --schema hr --database company_db
+```
+
+**Just the short version, no big tables printed:**
+
+```bash
+./dpdpascanner --print-summary --database hr_db
+```
+
+## Project layout
+
+```
+.
+├── cmd/main.go          — CLI entry point, flags, per-instance dispatch
+├── piiscanner/          — scan engine: adapters, detectors, reporting, incremental state
+├── pkg/
+│   ├── postgresdb/, mysqldb/, sqlserverdb/, mongodb/, redisdb/  — per-engine DB clients
+│   ├── cmd_processor/   — manages the spaCy subprocess
+│   └── utils/
+├── python/spacy_runner.py — spaCy NER worker used by --piiscanner spacyscan
+├── conf.example.toml    — copy to config.toml
+└── scan_state/          — incremental scan state (generated at runtime)
+```
 
 ---
 
-## All Available Flags
+## Library usage (Go consumers)
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--config` | current folder | Folder containing `config.toml`. Use this if your config file lives somewhere else, e.g. `--config C:\configs\prod`. Not used with a `postgres://` URI. |
-| `--piiscanner` | *(not set — see below)* | Force one scan type for every table. Options: `datascan`, `metascan`, `deepscan`. Leave this flag out entirely to get the recommended automatic behavior — see "Default Behavior (no `--piiscanner` flag)" below. |
-| `--database` | *(all databases)* | Scan only this one database from config.toml. Not used with a `postgres://` URI. |
-| `--schema` | `public` | PostgreSQL schema to scan. Most databases only use `public`. |
-| `--target-host` | *(all hosts)* | Scan only the server with this hostname. Leave empty to scan every server in the config. Not used with a `postgres://` URI. |
-| `--exclude-table` | *(none)* | Comma-separated list of tables to skip. Example: `--exclude-table audit_logs,temp_data` |
-| `--include-table` | *(all tables)* | Comma-separated list of tables to scan. Every other table is skipped. |
-| `--print-all` | `false` | By default only High-confidence findings appear in the terminal, log files, and HTML report. Add this flag to also include Medium and Low confidence results. |
-| `--print-summary` | `false` | Print a short, condensed summary instead of the full results table. |
-| `--no-timeout` | `false` | To disable timeout after 5 minutes. Useful when running deepscan on large database |
+Import the `piiscanner` package to reuse India DPDP detection (column + value regexes, column-context gates, checksums) without running the CLI:
+
+```go
+import (
+	"context"
+
+	"github.com/klouddb/dpdpa_pii_db_scanner/piiscanner"
+)
+
+func example() {
+	col := piiscanner.NewIndiaColumnDetector()
+	val := piiscanner.NewIndiaValueDetector()
+	_ = col.Init()
+	_ = val.Init()
+
+	ctx := context.Background()
+	columnLabels, _ := col.Detect(ctx, "pan_number", nil)
+	columnContext := make(piiscanner.ColumnContext)
+	for _, l := range columnLabels {
+		columnContext[l.PIILabel] = true
+	}
+
+	// Pass columnContext so RequiresColumnContext entities (CVV, cheque, etc.) activate.
+	valueLabels, _ := val.Detect(ctx, "ABCDE1234F", columnContext)
+	_ = valueLabels
+
+	// Policy helpers for scoring / Phase-2 fallbacks (stay correct when new entities are added):
+	_ = piiscanner.IsWeightMergeEntity(piiscanner.PIILabel_PANNumber)
+	_ = piiscanner.MergeIndiaValueWeight(string(piiscanner.PIILabel_PANNumber), 1.0, 0.3)
+	_, _ = piiscanner.RunIndiaUnrecognizedColumnFallbacks(ctx, nil, true, nil)
+}
+```
+
+Bump the module version in your consumer to pick up new India entities and column rules without copying detector code.
+
 ---
+
+## Troubleshooting
+
+| Problem                                                                      | Solution                                                                                                                                                                                                                                        |
+| ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Failed to load config.toml`                                                 | Make sure `config.toml` exists in the folder you're running the scanner from, or use `--config` to point to its location. On Linux, if no local file is found the scanner also checks `/etc/dpdpascanner/config.toml` before giving up.         |
+| `Could not connect`                                                          | Check that PostgreSQL is running, and that the host, port, user, and password in `config.toml` are correct.                                                                                                                                     |
+| `go: command not found`                                                      | Go is not installed or not on your system PATH — [install Go](https://go.dev/dl/).                                                                                                                                                              |
+| Scan takes a long time                                                       | Use `--piiscanner metascan` for the fastest possible scan, or `--include-table` to scan only specific tables.                                                                                                                                   |
+| Scanner is asking `Do you want to continue? (yes=Y \| no=N \| yes to all=A)` | This only appears during `deepscan` on a table with more than 100,000 rows, so you don't accidentally wait hours without warning. Type `Y` to continue, `N` to skip that table, or `A` to say yes to every large table for the rest of the run. |
+| Terminal / HTML / logs show only High confidence                             | This is expected by default. Re-run with `--print-all` to include Medium and Low confidence findings.                                                                                                                                           |
+| `[SKIP] Could not connect` for one instance                                  | Other instances in your config still get scanned normally. Fix the credentials for the skipped instance in `config.toml` and re-run.                                                                                                            |
+| `database "..." not found in config.toml`                                    | The name you passed to `--database` doesn't match any database listed under `databases = [...]` in your `config.toml`. Check spelling.                                                                                                          |

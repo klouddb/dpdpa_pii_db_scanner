@@ -29,6 +29,11 @@ func luhnValid(number string) bool {
 	return sum%10 == 0
 }
 
+// LuhnValid reports whether number passes the Luhn checksum (credit cards).
+func LuhnValid(number string) bool {
+	return luhnValid(number)
+}
+
 // RegionIndia loads Indian PII entities (Aadhaar, PAN, DL, Passport, VoterID, etc.).
 const RegionIndia = "india"
 
@@ -38,6 +43,9 @@ type RegexWithWeight struct {
 	Region                string // empty means global
 	RequiresColumnContext bool   // if true, only activates when column name also matches
 }
+
+var creditCardCleaner = strings.NewReplacer(" ", "", "-", "", "+", "")
+var aadhaarCleaner = strings.NewReplacer(" ", "", "-", "")
 
 var verhoeffD = [10][10]int{
 	{0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
@@ -231,21 +239,14 @@ func (r *baseRegexDetector) Detect(ctx context.Context, word string, columnConte
 				if !r.isColumnDetector {
 
 					if label == PIILabel_CreditCard {
-						cleaned := strings.NewReplacer(
-							" ", "",
-							"-", "",
-							"+", "",
-						).Replace(matched)
+						cleaned := creditCardCleaner.Replace(matched)
 
 						if !luhnValid(cleaned) {
 							continue
 						}
 					}
 					if label == PIILabel_AdharcardNumber {
-						cleaned := strings.NewReplacer(
-							" ", "",
-							"-", "",
-						).Replace(matched)
+						cleaned := aadhaarCleaner.Replace(matched)
 
 						if !verhoeffValid(cleaned) {
 							continue
@@ -497,13 +498,13 @@ func (r *regexColumnDetector) Init() error {
 			{
 				// Medium confidence - generic card terms without a payment-network/type qualifier
 				Regexp: regexp.MustCompile(`(?i)\b(card[\s_-]?number|card[\s_-]?no|card[\s_-]?num|card[\s_-]?id|card[\s_-]?details|card[\s_-]?info|card[\s_-]?data)\b`),
-				Weight: 0.5,
+				Weight: 0.7,
 				Region: RegionIndia,
 			},
 			{
 				// Low confidence - broad fallback (also covers concatenated names without separators)
 				Regexp: regexp.MustCompile(`(?i)^.*(credit[\s_-]?card|debit[\s_-]?card|card[\s_-]?number|cc[\s_-]?number|payment[\s_-]?card|bank[\s_-]?card).*$`),
-				Weight: 0.3,
+				Weight: 0.5,
 				Region: RegionIndia,
 			},
 		},
@@ -1058,16 +1059,6 @@ func (r *regexValueDetector) Init() error {
 				Weight: 0.85,
 				Region: RegionIndia,
 			},
-			{
-				Regexp: regexp.MustCompile(`\b([A-Za-z]{5}[0-9]{4}[A-Za-z]{1})\b`),
-				Weight: 0.85,
-				Region: RegionIndia,
-			},
-			// {
-			// 	Regexp: regexp.MustCompile(`\b((?=.*?[a-zA-Z])(?=.*?[0-9]{4})[\w@#$%^?~-]{10})\b`),
-			// 	Weight: 0.05,
-			//        Region: RegionIndia,
-			// },
 		},
 		PIILabel_AdharcardNumber: {
 			{

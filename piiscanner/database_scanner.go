@@ -2,9 +2,9 @@ package piiscanner
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -12,8 +12,6 @@ import (
 	"time"
 
 	"github.com/jedib0t/go-pretty/v6/text"
-	cons "github.com/klouddb/dpdpa_pii_db_scanner/pkg/const"
-	"github.com/klouddb/dpdpa_pii_db_scanner/pkg/postgresdb"
 	"github.com/klouddb/dpdpa_pii_db_scanner/pkg/utils"
 	"github.com/schollz/progressbar/v3"
 )
@@ -38,16 +36,32 @@ type Config struct {
 	printAllResults  bool
 	spacyOnly        bool
 	PrintSummaryOnly bool
+
+	// Incremental enables differential scanning: only new tables/columns or
+	// tables that need a deeper scan are re-scanned; existing results are
+	// carried forward from the state file.
+	Incremental bool
 }
 
-func NewConfig(pgConfig *postgresdb.Postgres, runOption, excludeTable, includeTable, database, schema string,
-	printAllResults, spacyOnly, printSummaryOnly bool) (*Config, error) {
+func NewConfig(runOption, excludeTable, includeTable, database, schema string, printAllResults, spacyOnly, printSummaryOnly bool, incremental bool) (*Config, error) {
+
 	if printAllResults && printSummaryOnly {
 		return nil, fmt.Errorf("--print-all and --print-summary are not allowed together")
 	}
 
-	if pgConfig == nil {
-		return nil, errors.New(cons.Err_PostgresConfig_Missing)
+	if database == "" {
+		return nil, errors.New("database name is required")
+	}
+
+	// Incremental is incompatible with metascan (no value data recorded) and
+	// spacyscan (uses a different detection pipeline not tracked in state).
+	if incremental {
+		if runOption == RunOption_MetaScan_String {
+			return nil, fmt.Errorf("--incremental cannot be used with --piiscanner metascan: meta scan does not record value-level findings in state")
+		}
+		if runOption == RunOption_SpacyScan_String || spacyOnly {
+			return nil, fmt.Errorf("--incremental cannot be used with spacyscan or --spacy-only")
+		}
 	}
 
 	var useSpacy bool
@@ -86,10 +100,6 @@ func NewConfig(pgConfig *postgresdb.Postgres, runOption, excludeTable, includeTa
 		}
 	}
 
-	if database == "" {
-		database = pgConfig.DBName
-	}
-
 	out := &Config{
 		runOption:        r,
 		AutoDetect:       autoDetect,
@@ -99,6 +109,7 @@ func NewConfig(pgConfig *postgresdb.Postgres, runOption, excludeTable, includeTa
 		printAllResults:  printAllResults,
 		spacyOnly:        spacyOnly,
 		PrintSummaryOnly: printSummaryOnly,
+		Incremental:      incremental,
 	}
 
 	if excludeTable != "" {
@@ -112,58 +123,73 @@ func NewConfig(pgConfig *postgresdb.Postgres, runOption, excludeTable, includeTa
 	return out, nil
 }
 
-type DBHelper interface {
-	GetAllTables(ctx context.Context, store *sql.DB) ([]string, error)
-	UpdateTableName(table string) string
-}
-
-type postgresDBHelper struct {
-	schema string
-}
-
-func NewPostgresDBHelper(schema string) DBHelper {
-	if schema == "" {
-		schema = "public"
-	}
-	return &postgresDBHelper{schema: schema}
-}
-
-func (p *postgresDBHelper) GetAllTables(ctx context.Context, store *sql.DB) ([]string, error) {
-	// check if schema exists
-	exists, err := utils.SchemaExists(ctx, store, p.schema)
-	if err != nil {
-		return nil, err
-	}
-
-	if !exists {
-		return nil, fmt.Errorf("schema %s does not exist", p.schema)
-	}
-
-	return utils.GetListFromQuery(ctx, store, "SELECT table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema = '"+p.schema+"'")
-}
-
-func (p *postgresDBHelper) UpdateTableName(table string) string {
-	return fmt.Sprintf("\"%s\".\"%s\"", p.schema, table)
-}
-
 type databasePiiScanner struct {
-	h                DBHelper
-	store            *sql.DB
+	adapter          DBAdapter
 	tableScanManager *TableScanManager
 
 	numOfRunners int
+	cnf          *Config
+	spinner      *scanningSpinner
 
-	cnf *Config
+	// incremental scan state
+	stateFilePath   string
+	previousState   *HostDbState          // loaded at scan start; nil = no prior state
+	carriedFindings map[string]TableState // tableName → findings carried forward from state
 
-	spinner *scanningSpinner
+	// liveTableNames is the full, unfiltered set of tables that exist in the
+	// database right now (independent of --include-table/--exclude-table).
+	// Lets BuildStateSnapshot tell "excluded from this run" (keep the old
+	// state entry) apart from "dropped from the database" (delete it).
+	liveTableNames map[string]bool
+
+	// effectiveDepth records, per table, the depth actually used this run
+	// ("datascan"/"deepscan"). In auto-detect mode this is decided per table
+	// from its row count, so it can't be derived from a single cnf.runOption.
+	effectiveDepth   map[string]string
+	effectiveDepthMu sync.Mutex
+
+	// rowDiffOnlyColumns marks, per table, which columns were scanned in
+	// "new rows only" mode this run (as opposed to a full column scan).
+	// GetResults() needs this to know which carried findings must be
+	// additively merged rather than replaced outright.
+	rowDiffOnlyColumns map[string]map[string]bool
+
+	// detectedCursors holds a freshly-detected cursor for tables that got a
+	// full scan this run OUTSIDE the carriedFindings bookkeeping.
+	// BuildStateSnapshot reads this so a baseline gets recorded even when
+	// --incremental wasn't used this run.
+	detectedCursors map[string]RowCursor
 }
 
-func NewDatabasePiiScanner(h DBHelper, store *sql.DB, cnf *Config) *databasePiiScanner {
+func NewDatabasePiiScanner(adapter DBAdapter, cnf *Config) *databasePiiScanner {
 	return &databasePiiScanner{
-		h: h, store: store,
-		numOfRunners: runtime.NumCPU(),
-		cnf:          cnf,
+		adapter:        adapter,
+		numOfRunners:   runtime.NumCPU(),
+		cnf:            cnf,
+		effectiveDepth: make(map[string]string),
 	}
+}
+
+// recordEffectiveDepth stores the depth actually used for a table this run.
+func (d *databasePiiScanner) recordEffectiveDepth(tableName, depth string) {
+	d.effectiveDepthMu.Lock()
+	defer d.effectiveDepthMu.Unlock()
+	d.effectiveDepth[tableName] = depth
+}
+
+// for safe reads of the mutex-guarded map
+func (d *databasePiiScanner) getEffectiveDepth(tableName string) string {
+	d.effectiveDepthMu.Lock()
+	defer d.effectiveDepthMu.Unlock()
+	return d.effectiveDepth[tableName]
+}
+
+func toSet(items []string) map[string]bool {
+	set := make(map[string]bool, len(items))
+	for _, item := range items {
+		set[item] = true
+	}
+	return set
 }
 
 func (d *databasePiiScanner) Close() {
@@ -188,7 +214,7 @@ func (d *databasePiiScanner) DetectorFactory() []Detector {
 	detectors := []Detector{}
 
 	if !d.cnf.spacyOnly {
-		detectors = append(detectors, NewRegexValueDetector())
+		detectors = append(detectors, NewRegexValueDetectorForRegion(RegionIndia))
 	}
 
 	if d.cnf.useSpacy {
@@ -198,16 +224,19 @@ func (d *databasePiiScanner) DetectorFactory() []Detector {
 	return detectors
 }
 
-func (d *databasePiiScanner) GetTables(ctx context.Context) ([]string, error) {
+func (d *databasePiiScanner) GetTables(ctx context.Context) ([]TableRef, error) {
 	if len(d.cnf.includeTable) != 0 {
-		return d.cnf.includeTable, nil
+		tables := make([]TableRef, len(d.cnf.includeTable))
+		for i, name := range d.cnf.includeTable {
+			tables[i] = TableRef{Schema: d.cnf.Schema, Name: name}
+		}
+		return tables, nil
 	}
 
-	tables, err := d.h.GetAllTables(ctx, d.store)
+	tables, err := d.adapter.ListTables(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("error getting tables: %v", err)
 	}
-
 	return tables, nil
 }
 
@@ -303,7 +332,48 @@ func (d *databasePiiScanner) Scan(ctx context.Context) error {
 
 	fmt.Println("> Found", len(tables), "tables")
 
-	d.tableScanManager = NewTableScanManager().WithColumnDetector(NewRegexColumnDetector())
+	// ── State bookkeeping: load previous state + the full live table set ─────
+	// Runs whenever a state file is wired at all — default runs included, not
+	// just --incremental — so BuildStateSnapshot can correctly preserve state
+	// for tables outside this run's scope (--include-table/--exclude-table)
+	// while still dropping tables genuinely gone from the database.
+	if d.stateFilePath != "" {
+		state, err := LoadState(d.stateFilePath)
+		if err != nil {
+			if d.cnf.Incremental {
+				if os.IsNotExist(err) {
+					fmt.Printf("> [incremental] no previous state found for %s/%s — running full scan\n",
+						d.previousState.Host, d.cnf.Database)
+				} else {
+					fmt.Printf("> [incremental] warning: could not load state (%v) — running full scan\n", err)
+				}
+			}
+			d.previousState = nil
+		} else {
+			d.previousState = state
+		}
+		if d.cnf.Incremental {
+			d.carriedFindings = make(map[string]TableState)
+		}
+
+		liveTables := tables
+		if len(d.cnf.includeTable) != 0 {
+			// GetTables() returned only the --include-table subset in this
+			// case, not the real live list — fetch it separately.
+			var err error
+			liveTables, err = d.adapter.ListTables(ctx)
+			if err != nil {
+				return fmt.Errorf("error listing tables for state bookkeeping: %v", err)
+			}
+		}
+		d.liveTableNames = make(map[string]bool, len(liveTables))
+		for _, t := range liveTables {
+			d.liveTableNames[t.DisplayName()] = true
+		}
+	}
+	// ─────────────────────────────────────────────────────────────────────────
+
+	d.tableScanManager = NewTableScanManager().WithColumnDetector(NewRegexColumnDetectorForRegion(RegionIndia))
 	if d.cnf.runOption != RunOption_MetaScan {
 		d.tableScanManager.WithDetectorFactory(d.DetectorFactory)
 	}
@@ -319,9 +389,242 @@ func (d *databasePiiScanner) Scan(ctx context.Context) error {
 		return nil
 	})
 
+	var skippedCount, newTableCount, newColumnCount, depthUpgradeCount, newRowsCount, baselineEstablishedCount int
+
+	explicitDeepscan := !d.cnf.AutoDetect && d.cnf.runOption == RunOption_DeepScan
+
 	for _, table := range tables {
-		if d.cnf.excludeTable != nil && d.cnf.excludeTable.Contains(table) {
+		if d.cnf.excludeTable != nil && d.cnf.excludeTable.Contains(table.Name) {
 			continue
+		}
+
+		var segments []scanSegment
+		var knownRowCount *int
+
+		if d.cnf.Incremental {
+			if d.previousState == nil {
+				// First-ever --incremental run for this host+database
+				// (or right after --reset-incremental) — no baseline to
+				// diff against, so every table is effectively new.
+				newTableCount++
+			} else {
+				d.pauseSpinner()
+				tableName := table.DisplayName()
+				prevTable, existed := d.previousState.Tables[tableName]
+
+				if existed {
+					prevColSet := make(map[string]bool, len(prevTable.Columns))
+					for _, c := range prevTable.Columns {
+						prevColSet[c] = true
+					}
+					rawColumns, err := d.adapter.ListColumns(ctx, table)
+					if err != nil {
+						return fmt.Errorf("error listing columns for %s: %v", tableName, err)
+					}
+					liveColumns := FilterColumns(rawColumns)
+					liveColSet := make(map[string]bool, len(liveColumns))
+					for _, c := range liveColumns {
+						liveColSet[c] = true
+					}
+
+					var newColumns []string
+					for _, c := range liveColumns {
+						if !prevColSet[c] {
+							newColumns = append(newColumns, c)
+						}
+					}
+
+					// Recorded columns that no longer exist live — prune
+					// them from whatever gets carried forward.
+					var droppedColumns []string
+					keptColumns := make([]string, 0, len(prevTable.Columns))
+					keptFindings := make(map[string][]PIIDataWithWeightString, len(prevTable.Findings))
+					for _, c := range prevTable.Columns {
+						if liveColSet[c] {
+							keptColumns = append(keptColumns, c)
+							if f, ok := prevTable.Findings[c]; ok {
+								keptFindings[c] = f
+							}
+						} else {
+							droppedColumns = append(droppedColumns, c)
+						}
+					}
+					if len(droppedColumns) > 0 {
+						fmt.Print(text.FgHiMagenta.Sprintf("> %s: %d column(s) no longer exist %v — removing from recorded state\n",
+							tableName, len(droppedColumns), droppedColumns))
+					}
+
+					requestedDepth, rowCount, hasRowCount, err := d.requestedDepthForTable(ctx, table)
+					if err != nil {
+						return err
+					}
+					if hasRowCount {
+						rc := rowCount
+						knownRowCount = &rc
+					}
+					depthOK := IsDepthSufficient(prevTable.Depth, requestedDepth)
+
+					switch {
+					case !depthOK:
+						// prevTable.Depth == datascan, requestedDepth ==
+						// deepscan — the only way depthOK can be false,
+						// since deepscan-saved always satisfies any request.
+						depthUpgradeCount++
+						fmt.Print(text.FgHiMagenta.Sprintf("> %s: depth insufficient (%s < %s) — running full value rescan\n",
+							tableName, prevTable.Depth, requestedDepth))
+						// Falls through to a full, unrestricted scan below.
+
+					case prevTable.Depth == Depth_DataScan:
+						// depthOK == true here implies requestedDepth ==
+						// datascan too. Cursor is never involved for a
+						// sampled table — a sample was never meant to be
+						// exhaustive, so there's no "new rows" guarantee to
+						// chase.
+						if len(newColumns) == 0 {
+							skippedCount++
+							d.carriedFindings[tableName] = TableState{Columns: keptColumns, Depth: prevTable.Depth, Findings: keptFindings}
+							d.resumeSpinner()
+							continue
+						}
+						newColumnCount++
+						fmt.Print(text.FgHiMagenta.Sprintf("> %s: %d new column(s) detected %v — scanning new column(s) only, existing columns carried forward\n",
+							tableName, len(newColumns), newColumns))
+						d.carriedFindings[tableName] = TableState{Columns: keptColumns, Depth: requestedDepth, Findings: keptFindings}
+						segments = []scanSegment{{columns: toSet(newColumns)}}
+
+					default:
+						// prevTable.Depth == deepscan. depthOK == true
+						// regardless of what's requested — deepscan always
+						// satisfies any ask, whether that's an explicit
+						// deepscan, an explicit datascan, or auto-detect.
+						// Cursor logic only activates on an explicit
+						// --piiscanner deepscan run; otherwise this behaves
+						// exactly like today, and a cursor still gets
+						// silently captured afterward as a bonus (see the
+						// "opportunistic cursor capture" block below).
+						if !explicitDeepscan {
+							if len(newColumns) == 0 {
+								skippedCount++
+								d.carriedFindings[tableName] = TableState{Columns: keptColumns, Depth: prevTable.Depth, Findings: keptFindings, RowCursor: prevTable.RowCursor}
+								d.resumeSpinner()
+								continue
+							}
+							newColumnCount++
+							fmt.Print(text.FgHiMagenta.Sprintf("> %s: %d new column(s) detected %v — scanning new column(s) only, existing columns carried forward\n",
+								tableName, len(newColumns), newColumns))
+							d.carriedFindings[tableName] = TableState{Columns: keptColumns, Depth: requestedDepth, Findings: keptFindings, RowCursor: prevTable.RowCursor}
+							segments = []scanSegment{{columns: toSet(newColumns)}}
+							break
+						}
+
+						cursor, cursorOK, cursorErr := d.adapter.DetectRowCursor(ctx, table)
+						if cursorErr != nil {
+							return fmt.Errorf("error detecting row cursor for %s: %v", tableName, cursorErr)
+						}
+
+						var advanced bool
+						haveBaseline := false
+						if cursorOK && prevTable.RowCursor != nil {
+							advanced, err = CursorAdvanced(*prevTable.RowCursor, cursor)
+							if err != nil {
+								// Cursor column/kind changed since last run
+								// (e.g. the primary key was redefined) —
+								// treat like "not found," not a hard error.
+								cursorOK = false
+							} else {
+								haveBaseline = true
+							}
+						}
+
+						switch {
+						case !cursorOK:
+							// Genuinely no cursor column available this run,
+							// OR the previously recorded cursor no longer
+							// matches
+							fmt.Print(text.FgHiMagenta.Sprintf("> %s: row cursor unavailable (schema/PK changed) — skipping row-level diff, only checking for new columns\n", tableName))
+							if len(newColumns) == 0 {
+								skippedCount++
+								d.carriedFindings[tableName] = TableState{Columns: keptColumns, Depth: prevTable.Depth, Findings: keptFindings}
+								d.resumeSpinner()
+								continue
+							}
+							newColumnCount++
+							fmt.Print(text.FgHiMagenta.Sprintf("> %s: %d new column(s) detected %v — scanning new column(s) only, existing columns carried forward\n",
+								tableName, len(newColumns), newColumns))
+							d.carriedFindings[tableName] = TableState{Columns: keptColumns, Depth: requestedDepth, Findings: keptFindings}
+							segments = []scanSegment{{columns: toSet(newColumns)}}
+
+						case !haveBaseline:
+							// A cursor column exists now, but there's no
+							// previous baseline to compare against — it just
+							// became valid (e.g. the column was just made an
+							// identity PK), or this is the first run to
+							// notice it. We can't tell whether rows arrived
+							// while this table had no cursor tracked — it
+							// was being silently skipped until now — so
+							// treat this like a first-ever deepscan: full
+							// rescan now, then start tracking the cursor
+							// from here.
+							baselineEstablishedCount++
+							fmt.Print(text.FgHiMagenta.Sprintf("> %s: cursor newly available (%s) — running full scan once to establish a baseline\n",
+								tableName, cursor.Column))
+							if d.detectedCursors == nil {
+								d.detectedCursors = make(map[string]RowCursor)
+							}
+							d.detectedCursors[tableName] = cursor
+
+						default:
+							// Cursor exists and we have a previous baseline to compare against.
+							if !advanced && len(newColumns) == 0 {
+								skippedCount++
+								d.carriedFindings[tableName] = TableState{Columns: keptColumns, Depth: prevTable.Depth, Findings: keptFindings, RowCursor: &cursor}
+								d.resumeSpinner()
+								continue
+							}
+
+							d.carriedFindings[tableName] = TableState{Columns: keptColumns, Depth: requestedDepth, Findings: keptFindings, RowCursor: &cursor}
+
+							if advanced {
+								newRowsCount++
+								fmt.Print(text.FgHiMagenta.Sprintf("> %s: new rows detected (cursor %s: %s -> %s) — scanning new rows only for existing columns\n",
+									tableName, cursor.Column, prevTable.RowCursor.Value, cursor.Value))
+								if d.rowDiffOnlyColumns == nil {
+									d.rowDiffOnlyColumns = make(map[string]map[string]bool)
+								}
+								if d.rowDiffOnlyColumns[tableName] == nil {
+									d.rowDiffOnlyColumns[tableName] = make(map[string]bool, len(keptColumns))
+								}
+								for _, c := range keptColumns {
+									d.rowDiffOnlyColumns[tableName][c] = true
+								}
+								lastCursor := *prevTable.RowCursor
+								segments = append(segments, scanSegment{columns: toSet(keptColumns), rowCursor: &lastCursor})
+							}
+							if len(newColumns) > 0 {
+								newColumnCount++
+								fmt.Print(text.FgHiMagenta.Sprintf("> %s: %d new column(s) detected %v — scanning new column(s) only, existing columns carried forward\n",
+									tableName, len(newColumns), newColumns))
+								segments = append(segments, scanSegment{columns: toSet(newColumns)})
+							}
+						}
+					}
+				} else {
+					newTableCount++
+					fmt.Print(text.FgHiMagenta.Sprintf("> %s: new table found — running full value scan\n", table.DisplayName()))
+				}
+				d.resumeSpinner()
+			}
+		}
+
+		var preScanCursor RowCursor
+		var preScanCursorOK bool
+		if d.stateFilePath != "" {
+			if _, alreadyCarried := d.carriedFindings[table.DisplayName()]; !alreadyCarried {
+				if cursor, ok, err := d.adapter.DetectRowCursor(ctx, table); err == nil && ok {
+					preScanCursor = cursor
+					preScanCursorOK = true
+				}
+			}
 		}
 
 		err := initFunction()
@@ -329,14 +632,60 @@ func (d *databasePiiScanner) Scan(ctx context.Context) error {
 			return fmt.Errorf("error starting table scan manager: %v", err)
 		}
 
-		// fmt.Println("> Processing table", table)
-		s := NewPiiTableScanner(d.h.UpdateTableName(table), d.store, d.tableScanManager, d.cnf.runOption, d.cnf.AutoDetect, d.cnf.useSpacy, d.pauseSpinner, d.resumeSpinner)
+		s := NewTableScanner(table, d.adapter, d.tableScanManager, d.cnf.runOption, d.cnf.AutoDetect, d.cnf.useSpacy, d.pauseSpinner, d.resumeSpinner, d.recordEffectiveDepth, segments, knownRowCount)
 		if err := s.processTable(ctx); err != nil {
-			return fmt.Errorf("error processing table %s: %v", table, err)
+			return fmt.Errorf("error processing table %s: %v", table.DisplayName(), err)
 		}
-		// fmt.Println("> Done processing table", table)
+
+		// Opportunistic cursor capture: independent of --incremental. Uses
+		// preScanCursor (detected BEFORE processTable ran) rather than
+		// re-detecting afterward — a post-scan MAX(id) would see rows
+		// inserted while the scan was in progress, even though the scan's
+		// own snapshot never actually read them, producing a watermark
+		// higher than what was really covered and silently skipping those
+		// rows on every future incremental run.
+		if preScanCursorOK {
+			_, alreadyCarried := d.carriedFindings[table.DisplayName()]
+			_, alreadyDetected := d.detectedCursors[table.DisplayName()]
+			if !alreadyCarried && !alreadyDetected && d.getEffectiveDepth(table.DisplayName()) == Depth_DeepScan {
+				if d.detectedCursors == nil {
+					d.detectedCursors = make(map[string]RowCursor)
+				}
+				d.detectedCursors[table.DisplayName()] = preScanCursor
+			}
+		}
 	}
+
+	if d.cnf.Incremental {
+		d.pauseSpinner()
+		fmt.Printf("> [incremental] summary: %d table(s) skipped (already covered), %d new table(s), %d table(s) with new columns, %d table(s) with new rows, %d table(s) establishing a new cursor baseline, %d table(s) rescanned for depth\n",
+			skippedCount, newTableCount, newColumnCount, newRowsCount, baselineEstablishedCount, depthUpgradeCount)
+		d.resumeSpinner()
+	}
+
 	return nil
+}
+
+// requestedDepthForTable returns the depth that will actually be applied to
+// this table in the current run. In auto-detect mode it also returns the row
+// count it queried to decide that, so the caller can pass it on to
+// processTable() and avoid paying for a second COUNT(*) on the same table.
+func (d *databasePiiScanner) requestedDepthForTable(ctx context.Context, table TableRef) (depth string, rowCount int, hasRowCount bool, err error) {
+	switch d.cnf.runOption {
+	case RunOption_DeepScan:
+		return Depth_DeepScan, 0, false, nil
+	case RunOption_DataScan:
+		return Depth_DataScan, 0, false, nil
+	default:
+		rowCount, err = d.adapter.RowCount(ctx, table)
+		if err != nil {
+			return "", 0, false, fmt.Errorf("error getting row count for %s: %v", table.DisplayName(), err)
+		}
+		if rowCount < AUTO_SCAN_ROW_THRESHOLD {
+			return Depth_DeepScan, rowCount, true, nil
+		}
+		return Depth_DataScan, rowCount, true, nil
+	}
 }
 
 type DatabasePIIScanOutput struct {
@@ -388,9 +737,52 @@ func (p *PIIDataWithWeightString) SetScanedValueAndMatchCount(matchCount, scaned
 	p.MatchedCount = matchCount
 }
 
+// mergeFindingsAdditive combines two findings slices for the same column,
+// summing counts for matching (Label, DetectorType, DetectorName) entries.
+// Used only for columns scanned in "new rows only" mode, where fresh
+// reflects just the new rows, not the whole table — unlike a full column
+// scan, it must be added to carried, not replace it.
+func mergeFindingsAdditive(carried, fresh []PIIDataWithWeightString) []PIIDataWithWeightString {
+	type key struct {
+		label   PIILabel
+		detType DetectorType
+		detName string
+	}
+	merged := make(map[key]*PIIDataWithWeightString, len(carried)+len(fresh))
+	order := make([]key, 0, len(carried)+len(fresh))
+
+	for _, item := range carried {
+		item := item
+		k := key{item.Label, item.DetectorType, item.DetectorName}
+		merged[k] = &item
+		order = append(order, k)
+	}
+	for _, item := range fresh {
+		k := key{item.Label, item.DetectorType, item.DetectorName}
+		if existing, ok := merged[k]; ok {
+			totalScanned := existing.ScanedValueCount + item.ScanedValueCount
+			if totalScanned > 0 {
+				existing.Weight = (existing.Weight*float64(existing.ScanedValueCount) + item.Weight*float64(item.ScanedValueCount)) / float64(totalScanned)
+			}
+			existing.ScanedValueCount = totalScanned
+			existing.MatchedCount += item.MatchedCount
+			existing.Confidence, existing.ConfidenceIcon = getConfidenceLabel(existing.Weight)
+		} else {
+			item := item
+			merged[k] = &item
+			order = append(order, k)
+		}
+	}
+
+	out := make([]PIIDataWithWeightString, 0, len(order))
+	for _, k := range order {
+		out = append(out, *merged[k])
+	}
+	return out
+}
+
 func (d *databasePiiScanner) GetResults() (*DatabasePIIScanOutput, error) {
 	if d.tableScanManager == nil {
-		// this handles the case when no table is scanned
 		return nil, nil
 	}
 
@@ -416,6 +808,8 @@ func (d *databasePiiScanner) GetResults() (*DatabasePIIScanOutput, error) {
 		Data:            make(map[string]TableDetailOutput),
 	}
 
+	fallbackDetector := NewRegexValueDetector()
+	fallbackDetectorReady := fallbackDetector.Init() == nil
 	for _, table := range data {
 		output.Data[table.TableName] = make(map[string][]PIIDataWithWeightString)
 		for columnName, piiMap := range table.PiiDataMap {
@@ -429,8 +823,18 @@ func (d *databasePiiScanner) GetResults() (*DatabasePIIScanOutput, error) {
 			}
 
 			count := d.tableScanManager.valueCount[table.TableName][columnName]
+			unknownColumn := len(piiMap.ColumnMap) == 0
+			var results []PIIDataWithWeightString
 			for detector, piiData := range piiMap.ValueMap {
 				for label, pii := range piiData {
+
+					if count != 0 {
+						ratio := float64(pii.Count) / float64(count)
+						if unknownColumn && ratio < 0.30 {
+							continue
+						}
+					}
+
 					var finalWeight float64
 					if count != 0 {
 						finalWeight = pii.Weight / float64(count)
@@ -444,9 +848,10 @@ func (d *databasePiiScanner) GetResults() (*DatabasePIIScanOutput, error) {
 
 					piiDataWithWeight := NewPIIDataWithWeightString(label, finalWeight, DetectorType_ValueDetector, detector)
 					piiDataWithWeight.SetScanedValueAndMatchCount(pii.Count, count)
-					output.Data[table.TableName][columnName] = append(output.Data[table.TableName][columnName], *piiDataWithWeight)
+					results = append(results, *piiDataWithWeight)
 				}
 			}
+			output.Data[table.TableName][columnName] = append(output.Data[table.TableName][columnName], getBestLabel(results)...)
 
 			sort.Slice(output.Data[table.TableName][columnName], func(i, j int) bool {
 
@@ -472,23 +877,13 @@ func (d *databasePiiScanner) GetResults() (*DatabasePIIScanOutput, error) {
 			if !hasValidMatch {
 				sampleVals := d.tableScanManager.UnrecognizedValues[table.TableName][columnName]
 				if len(sampleVals) > 0 {
-					fallbackDetector := NewRegexValueDetector()
-					if err := fallbackDetector.Init(); err == nil {
+					if fallbackDetectorReady {
 						fallbackContext := ColumnContext{
-							PIILabel_BankAccountNumber:     true,
-							PIILabel_ChequeNumber:          true,
-							PIILabel_CIFNumber:             true,
-							PIILabel_LoanAccountNumber:     true,
-							PIILabel_InsurancePolicyNumber: true,
-							PIILabel_FASTagID:              true,
-							PIILabel_CVV:                   true,
-							PIILabel_Phone:                 true,
-							PIILabel_MICRCode:              true,
-							PIILabel_UAN:                   true,
-							PIILabel_VoterID:               true,
-							PIILabel_PassportNumber:        true,
-							PIILabel_TAN:                   true,
-							PIILabel_DrivingLicenceNumber:  true,
+							PIILabel_Phone:                true,
+							PIILabel_VoterID:              true,
+							PIILabel_PassportNumber:       true,
+							PIILabel_TAN:                  true,
+							PIILabel_DrivingLicenceNumber: true,
 						}
 
 						labelHits := make(map[PIILabel]int)
@@ -504,6 +899,13 @@ func (d *databasePiiScanner) GetResults() (*DatabasePIIScanOutput, error) {
 
 						totalSamples := len(sampleVals)
 						for lbl, hits := range labelHits {
+							if hits == 0 {
+								continue
+							}
+							ratio := float64(hits) / float64(totalSamples)
+							if ratio < 0.30 {
+								continue
+							}
 							if hits > 0 {
 								// Average weight over sampled values
 								avgWeight := labelWeights[lbl] / float64(totalSamples)
@@ -528,17 +930,30 @@ func (d *databasePiiScanner) GetResults() (*DatabasePIIScanOutput, error) {
 		}
 	}
 
-	// print output to console
-	// this code is for testing just to validate the output we are storing here.
-	// for table, columnData := range output.Data {
-	// 	fmt.Println("Table:", table)
-	// 	for column, piiData := range columnData {
-	// 		fmt.Println("Column:", column)
-	// 		for _, pii := range piiData {
-	// 			fmt.Println("Label:", pii.Label, "Confidence:", pii.Confidence, "Weight:", pii.Weight, "DetectorType:", pii.DetectorType, "DetectorName:", pii.DetectorName, "ScanedValueCount:", pii.ScanedValueCount, "MatchedCount:", pii.MatchedCount)
-	// 		}
-	// 	}
-	// }
+	// ── Incremental: merge carried-forward findings ───────────────────────────
+	for tableName, carried := range d.carriedFindings {
+		if _, exists := output.Data[tableName]; !exists {
+			output.Data[tableName] = make(TableDetailOutput)
+		}
+		for columnName, piis := range carried.Findings {
+			fresh, hasFresh := output.Data[tableName][columnName]
+			switch {
+			case !hasFresh:
+				// Live scan produced nothing for this column this run
+				// (skipped entirely, or a new-rows-only scan found no
+				// matches) — carried findings are still the whole truth.
+				output.Data[tableName][columnName] = piis
+			case d.rowDiffOnlyColumns[tableName][columnName]:
+				// Fresh findings only cover the new rows scanned this run —
+				// add to, don't replace, what was already known.
+				output.Data[tableName][columnName] = mergeFindingsAdditive(piis, fresh)
+			default:
+				// Fresh findings cover the whole column (new column, or a
+				// full rescan) — they supersede the carried ones entirely.
+			}
+		}
+	}
+	// ─────────────────────────────────────────────────────────────────────────
 
 	return output, nil
 }
@@ -553,64 +968,159 @@ func getConfidenceLabel(weight float64) (string, string) {
 	}
 }
 
-type piiTableScanner struct {
-	tableName string
-	store     *sql.DB
+// scanSegment describes one pass over a table's data: which columns to
+// read (nil = every live column), and whether to restrict it to rows added
+// after a cursor watermark (nil = every row). A table normally scans in a
+// single segment; it needs two only when a DeepScan incremental run finds
+// both new columns (which need their full history) and a usable row cursor
+// for columns it already knew about (which only need the new rows).
+type scanSegment struct {
+	columns   map[string]bool
+	rowCursor *RowCursor
+}
+
+type tableScanner struct {
+	table   TableRef
+	adapter DBAdapter
 
 	tableScanManager *TableScanManager
 
 	runOption  RunOption
 	autoDetect bool
-
-	runSpacy bool
+	runSpacy   bool
 
 	pauseSpinner  func()
 	resumeSpinner func()
+
+	onDepthDecided func(tableName, depth string)
+
+	// segments describes what to scan. nil or empty means "everything, in
+	// one pass" — today's default behavior.
+	segments []scanSegment
+
+	// knownRowCount, when set, is a row count already fetched by the
+	// incremental decision logic — processTable() uses it instead of
+	// querying RowCount() again.
+	knownRowCount *int
 }
 
-func NewPiiTableScanner(tableName string, store *sql.DB, tableScanManager *TableScanManager, runOption RunOption, autoDetect bool, runSpacy bool, pauseSpinner, resumeSpinner func()) *piiTableScanner {
-	return &piiTableScanner{
-		tableName: tableName,
-		store:     store,
-		// catcher:   catcher,
+func NewTableScanner(table TableRef, adapter DBAdapter, tableScanManager *TableScanManager, runOption RunOption, autoDetect bool, runSpacy bool, pauseSpinner, resumeSpinner func(), onDepthDecided func(tableName, depth string), segments []scanSegment, knownRowCount *int) *tableScanner {
+	return &tableScanner{
+		table: table, adapter: adapter,
 		tableScanManager: tableScanManager,
-
-		runOption:  runOption,
-		autoDetect: autoDetect,
-		runSpacy:   runSpacy,
-
-		pauseSpinner:  pauseSpinner,
-		resumeSpinner: resumeSpinner,
+		runOption:        runOption,
+		autoDetect:       autoDetect,
+		runSpacy:         runSpacy,
+		pauseSpinner:     pauseSpinner,
+		resumeSpinner:    resumeSpinner,
+		onDepthDecided:   onDepthDecided,
+		segments:         segments,
+		knownRowCount:    knownRowCount,
 	}
 }
 
-func (p *piiTableScanner) processTable(ctx context.Context) error {
+func getBestLabel(entries []PIIDataWithWeightString) []PIIDataWithWeightString {
+	if len(entries) <= 1 {
+		return entries
+	}
 
-	// defer fmt.Println("> Done processing table 1", p.tableName)
-	columns, err := p.processColumns(ctx)
+	rank := map[string]int{"High": 3, "Medium": 2, "Low": 1}
+	best := 0
+	for _, e := range entries {
+		if rank[e.Confidence] > best {
+			best = rank[e.Confidence]
+		}
+	}
+
+	var topTier []PIIDataWithWeightString
+	maxMatched := 0
+	for _, e := range entries {
+		if rank[e.Confidence] == best {
+			topTier = append(topTier, e)
+			if e.MatchedCount > maxMatched {
+				maxMatched = e.MatchedCount
+			}
+		}
+	}
+
+	var winners []PIIDataWithWeightString
+	for _, e := range topTier {
+		if e.MatchedCount == maxMatched {
+			winners = append(winners, e)
+		}
+	}
+	return winners
+}
+
+// liveColumns returns every currently-scannable column for this table.
+func (p *tableScanner) liveColumns(ctx context.Context) ([]string, error) {
+	rawColumns, err := p.adapter.ListColumns(ctx, p.table)
+	if err != nil {
+		return nil, err
+	}
+	return FilterColumns(rawColumns), nil
+}
+
+// resolveSegmentColumns intersects a segment's target columns with what's
+// live right now, and registers the result with the column-name detector.
+// Returns an empty slice if the segment has nothing left to scan.
+func (p *tableScanner) resolveSegmentColumns(ctx context.Context, live []string, seg scanSegment) ([]string, error) {
+	columns := live
+	if seg.columns != nil {
+		columns = nil
+		for _, c := range live {
+			if seg.columns[c] {
+				columns = append(columns, c)
+			}
+		}
+	}
+	for _, column := range columns {
+		err := p.tableScanManager.PushColumn(ctx, ScanInput{
+			Tablename:  p.table.DisplayName(),
+			ColumnName: column,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("error pushing column: %v", err)
+		}
+	}
+	return columns, nil
+}
+
+func (p *tableScanner) processTable(ctx context.Context) error {
+	live, err := p.liveColumns(ctx)
 	if err != nil {
 		return fmt.Errorf("error processing columns: %v", err)
 	}
-
-	if len(columns) == 0 {
+	if len(live) == 0 {
 		return nil
 	}
-
 	if p.runOption == RunOption_MetaScan {
+		// MetaScan only cares about column names/existence — register every
+		// live column once and stop; it never uses segmented row scanning.
+		for _, column := range live {
+			if err := p.tableScanManager.PushColumn(ctx, ScanInput{
+				Tablename:  p.table.DisplayName(),
+				ColumnName: column,
+			}); err != nil {
+				return fmt.Errorf("error pushing column: %v", err)
+			}
+		}
 		return nil
 	}
 
-	coloredTableName := text.Bold.Sprint(p.tableName)
+	displayName := p.table.DisplayName()
+	coloredTableName := text.Bold.Sprint(displayName)
 
 	effectiveOption := p.runOption
 	var rowCount int
 	if p.autoDetect || p.runOption == RunOption_DataScan || p.runOption == RunOption_DeepScan || p.runOption == RunOption_SpacyScan {
-		rowCount, err = utils.TableRowCount(ctx, p.store, p.tableName)
-		if err != nil {
-			return fmt.Errorf("error getting row count for table %s: %v", p.tableName, err)
-		}
-		if rowCount == 0 {
-			return nil
+		if p.knownRowCount != nil {
+			rowCount = *p.knownRowCount
+		} else {
+			rowCount, err = p.adapter.RowCount(ctx, p.table)
+			if err != nil {
+				return fmt.Errorf("error getting row count for table %s: %v", displayName, err)
+			}
 		}
 	}
 
@@ -627,6 +1137,14 @@ func (p *piiTableScanner) processTable(ctx context.Context) error {
 		} else {
 			effectiveOption = RunOption_DataScan
 		}
+	}
+
+	if p.onDepthDecided != nil {
+		depth := Depth_DataScan
+		if effectiveOption == RunOption_DeepScan {
+			depth = Depth_DeepScan
+		}
+		p.onDepthDecided(displayName, depth)
 	}
 
 	if p.runOption == RunOption_DataScan && rowCount < AUTO_SCAN_ROW_THRESHOLD {
@@ -668,7 +1186,7 @@ func (p *piiTableScanner) processTable(ctx context.Context) error {
 		}
 		if showsBar {
 			bar = progressbar.NewOptions(rowCount,
-				progressbar.OptionSetDescription("Processing "+p.tableName+" table"),
+				progressbar.OptionSetDescription("Processing "+displayName+" table"),
 				progressbar.OptionShowCount(),
 				progressbar.OptionFullWidth(),
 				progressbar.OptionSetItsString("rows"),
@@ -685,7 +1203,7 @@ func (p *piiTableScanner) processTable(ctx context.Context) error {
 					case <-barchan:
 						count++
 					case <-t.C:
-						bar.Add(count) // nolint:errcheck
+						bar.Add(count) //nolint:errcheck
 						count = 0
 					case <-closeChan:
 						bar.Finish() //nolint:errcheck
@@ -693,179 +1211,145 @@ func (p *piiTableScanner) processTable(ctx context.Context) error {
 						close(closeChan)
 						close(barchan)
 						t.Stop()
-						// fmt.Println(">", coloredTableName, text.FgGreen.Sprint("scanning completed"))
 						return
 					}
 				}
 			}()
 
-			// this is to refresh progress bar every second if file is taking more then second to process
 			defer func() {
 				closeChan <- struct{}{}
 			}()
 		}
 	}
 
-	query := fmt.Sprintf(`SELECT "%s" FROM %s`, strings.Join(columns, `","`), p.tableName)
-	if effectiveOption == RunOption_DataScan {
-		query = fmt.Sprintf(`SELECT "%s" FROM %s TABLESAMPLE BERNOULLI (10) REPEATABLE (%d) LIMIT 10000`, strings.Join(columns, `","`), p.tableName, DATASCAN_SAMPLE_SEED)
-	}
-
-	// defer fmt.Println(">", coloredTableName, text.FgGreen.Sprint("scanning completed 1"))
-	stmt, err := p.store.PrepareContext(ctx, query)
-	if err != nil {
-		return fmt.Errorf("error preparing statement: %v query:(%s)", err, query)
-	}
-
-	defer stmt.Close()
-	// defer fmt.Println(">", coloredTableName, text.FgGreen.Sprint("scanning completed 12"))
-	rows, err := stmt.QueryContext(ctx)
-	if err != nil {
-		return fmt.Errorf("error executing query: %v", err)
-	}
-	defer rows.Close()
-	// defer fmt.Println(">", coloredTableName, text.FgGreen.Sprint("scanning completed 123"))
-
-	count := len(columns)
-
-	for rows.Next() {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		// fmt.Println(">", coloredTableName, text.FgGreen.Sprint("scanning completed 1234"))
+	onRowScanned := func() {
 		if barchan != nil {
 			barchan <- struct{}{}
 		}
-		values := make([]interface{}, count)
-		scanArgs := make([]interface{}, count)
-		for i := range values {
-			scanArgs[i] = &values[i]
-		}
+	}
 
-		err := rows.Scan(scanArgs...)
+	segments := p.segments
+	if len(segments) == 0 {
+		segments = []scanSegment{{}}
+	}
+
+	for _, seg := range segments {
+		segColumns, err := p.resolveSegmentColumns(ctx, live, seg)
 		if err != nil {
-			return fmt.Errorf("error scanning row: %v", err)
+			return err
+		}
+		if len(segColumns) == 0 {
+			continue
 		}
 
-		for i := range values {
+		opts := SampleOptions{Mode: SampleMode_Full, RowCursor: seg.rowCursor}
+		if effectiveOption == RunOption_DataScan {
+			opts = SampleOptions{Mode: SampleMode_Limited, Size: 10000, Seed: DATASCAN_SAMPLE_SEED}
+		}
 
-			val := GetValuesString(values[i])
-			if val == "" || val == "NULL" || val == "<nil>" {
-				continue
-			}
-
-			err := p.tableScanManager.PushValue(ScanInput{
-				Tablename:  p.tableName,
-				ColumnName: columns[i],
-				Value:      val,
+		err = p.adapter.StreamValues(ctx, p.table, segColumns, opts, onRowScanned, func(columnName, value string) error {
+			return p.tableScanManager.PushValue(ScanInput{
+				Tablename:  displayName,
+				ColumnName: columnName,
+				Value:      value,
 			})
-			if err != nil {
-				return fmt.Errorf("error pushing value: %v", err)
-			}
+		})
+		if err != nil {
+			return err
 		}
-
 	}
 
 	return nil
 }
 
-// func (p *piiTableScanner) getColumns() ([]string, error) {
-// 	stmt, err := p.store.Prepare("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = '" + p.tableName + "';")
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	defer stmt.Close()
+// Helper functions for differential scan feature
 
-// 	rows, err := stmt.Query()
-// 	if err != nil {
-// 		return nil, err
-// 	}
-
-// 	defer rows.Close()
-
-// 	var columns []string
-// 	for rows.Next() {
-// 		var column string
-// 		var columnType string
-// 		err := rows.Scan(&column, &columnType)
-// 		if err != nil {
-// 			return nil, err
-// 		}
-
-// 		if !IgnoreColumn(column) && !IgnoreColumnType(columnType) {
-// 			columns = append(columns, column)
-// 		}
-// 	}
-
-// 	return columns, nil
-// }
-
-func (p *piiTableScanner) processColumns(ctx context.Context) ([]string, error) {
-
-	stmt, err := p.store.PrepareContext(ctx, fmt.Sprintf(`SELECT * FROM %s limit 0`, p.tableName))
-	if err != nil {
-		return nil, fmt.Errorf("error preparing statement: %v", err)
+// SetStateFilePath tells the scanner where to load and save its incremental
+// state file. Must be called before Scan().
+func (d *databasePiiScanner) SetStateFilePath(path string, host string) {
+	d.stateFilePath = path
+	// Pre-populate Host so the "no previous state" message can name the host.
+	d.previousState = &HostDbState{
+		Host:     host,
+		Database: d.cnf.Database,
+		Tables:   make(map[string]TableState),
 	}
-	defer stmt.Close()
-	rows, err := stmt.QueryContext(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("error executing query: %v", err)
-	}
-	defer rows.Close()
+}
 
-	columns, err := rows.Columns()
-	if err != nil {
-		return nil, fmt.Errorf("error getting columns: %v", err)
+// BuildStateSnapshot assembles a HostDbState from the current scan's processed
+// output plus any findings that were carried forward from the previous state.
+// Must be called after GetResults() succeeds, passing its return value as output.
+func (d *databasePiiScanner) BuildStateSnapshot(host, database, engine string, output *DatabasePIIScanOutput) *HostDbState {
+	state := &HostDbState{
+		Host:     host,
+		Database: database,
+		Engine:   engine,
+		Tables:   make(map[string]TableState),
 	}
 
-	// filter unwanted columns
-	columns = FilterColumns(columns)
-	if len(columns) == 0 {
-		return nil, nil
-	}
-
-	for _, column := range columns {
-		err := p.tableScanManager.PushColumn(ctx, ScanInput{
-			Tablename:  p.tableName,
-			ColumnName: column,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("error pushing column: %v", err)
+	// Seed from whatever was carried forward — a whole-table skip, or just
+	// the existing columns of a table that got a new-columns-only scan.
+	for tableName, carried := range d.carriedFindings {
+		findings := make(map[string][]PIIDataWithWeightString, len(carried.Findings))
+		for c, f := range carried.Findings {
+			findings[c] = f
+		}
+		state.Tables[tableName] = TableState{
+			Columns:   append([]string{}, carried.Columns...),
+			Depth:     carried.Depth,
+			Findings:  findings,
+			RowCursor: carried.RowCursor,
 		}
 	}
 
-	return columns, nil
+	// Merge in freshly-scanned columns: a brand new table, a full rescan, or
+	// just the new columns of a table whose old columns were seeded above.
+	if output != nil {
+		for tableName, columnData := range output.Data {
+			existing, hasCarried := state.Tables[tableName]
+			if !hasCarried {
+				depth := d.effectiveDepth[tableName]
+				if depth == "" {
+					depth = Depth_DataScan
+				}
+				existing = TableState{Depth: depth, Findings: make(map[string][]PIIDataWithWeightString)}
+				if depth == Depth_DeepScan {
+					if cursor, ok := d.detectedCursors[tableName]; ok {
+						c := cursor
+						existing.RowCursor = &c
+					}
+				}
+			}
+
+			colSet := make(map[string]bool, len(existing.Columns))
+			for _, c := range existing.Columns {
+				colSet[c] = true
+			}
+			for columnName, piis := range columnData {
+				if !colSet[columnName] {
+					existing.Columns = append(existing.Columns, columnName)
+					colSet[columnName] = true
+				}
+				if len(piis) > 0 {
+					existing.Findings[columnName] = piis
+				}
+			}
+			state.Tables[tableName] = existing
+		}
+	}
+
+	// Preserve tables merely out of this run's scope; drop ones genuinely
+	// gone from the live database.
+	if d.previousState != nil {
+		for tableName, prevTableState := range d.previousState.Tables {
+			if _, exists := state.Tables[tableName]; exists {
+				continue
+			}
+			if d.liveTableNames[tableName] {
+				state.Tables[tableName] = prevTableState
+			}
+		}
+	}
+
+	return state
 }
-
-// func (p *piiTableScanner) processValues(_ context.Context, values map[string]interface{}) error {
-// 	for column, value := range values {
-// 		err := p.tableScanManager.PushValue(ScanInput{
-// 			Tablename:  p.tableName,
-// 			ColumnName: column,
-// 			Value:      value,
-// 		})
-// 		if err != nil {
-// 			return err
-// 		}
-
-// 	}
-
-// 	return nil
-// }
-
-// func (p *piiTableScanner) getFinalResult() map[string]PIILabel {
-// 	out := make(map[string]PIILabel)
-
-// 	for column, labelScore := range p.result {
-// 		maxScore := 0.0
-// 		out[column] = ""
-// 		for label, score := range labelScore {
-// 			if score > maxScore {
-// 				maxScore = score
-// 				out[column] = label
-// 			}
-// 		}
-// 	}
-
-// 	return out
-// }
