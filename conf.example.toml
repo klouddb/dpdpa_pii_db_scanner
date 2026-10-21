@@ -1,16 +1,68 @@
+# ─────────────────────────────────────────────────────────────────
+# dpdpascanner — config.toml example
+#
+# Copy to config.toml and edit. Each [[instances]] block is one
+# database server; engine selects which fields apply:
+#   postgres (default) | mysql | sqlserver | mongodb | redis
+# ─────────────────────────────────────────────────────────────────
+
+# ── PostgreSQL ──────────────────────────────────────────────────
 [[instances]]
 host      = "localhost"
 port      = 5432
 user      = "postgres"
 password  = "yourpassword"
 databases = ["mydb"]
+sslmode   = "require"   # "disable" only for trusted local dev
 
-# TLS defaults to "require" when sslmode is omitted.
-# Use "disable" only for trusted local development.
-sslmode = "require"
 
-# For production certificate verification, use:
-# sslmode = "verify-full"
-# sslrootcert = "/path/to/root.crt"
-# sslcert = "/path/to/client.crt"
-# sslkey = "/path/to/client.key"
+# ── MySQL ───────────────────────────────────────────────────────
+[[instances]]
+engine    = "mysql"
+host      = "localhost"
+port      = 3306
+user      = "mysql_user"
+password  = "yourpassword"
+databases = ["mydb"]
+
+
+# ── SQL Server ──────────────────────────────────────────────────
+[[instances]]
+engine    = "sqlserver"
+host      = "localhost"
+port      = 1433
+user      = "sa"
+password  = "yourpassword"
+databases = ["mydb"]
+encrypt   = "true"
+
+
+# ── MongoDB ─────────────────────────────────────────────────────
+[[instances]]
+engine    = "mongodb"
+uri       = "mongodb://scanner_user:yourpassword@localhost:27017"
+databases = ["mydb"]
+
+
+# ── Redis ───────────────────────────────────────────────────────
+# Redis uses numbered DBs, not database names. --incremental is
+# unsupported here — always runs a full scan.
+[[instances]]
+engine    = "redis"
+host      = "localhost"
+port      = 6379
+password  = "yourpassword"
+redis_dbs = [0, 1]
+
+
+# ── RDS / Aurora ────────────────────────────────────────────────
+# Same fields as above, plus TLS. Works the same way for mysql and
+# sqlserver — just add tlsmode / encrypt + certificate as shown.
+[[instances]]
+host        = "mydb.xxxxxxxxxx.ap-south-1.rds.amazonaws.com"
+port        = 5432
+user        = "scanner_user"
+password    = "yourpassword"
+databases   = ["mydb"]
+sslmode     = "verify-full"
+sslrootcert = "/path/to/rds-ca-bundle.pem"   # from AWS's RDS SSL/TLS docs

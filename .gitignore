@@ -69,3 +69,13 @@ dpdpascanner
 
 
 kshield_pii_report.html
+
+.gitattributes
+
+scan_results/
+
+.agents/
+
+scan_state/
+
+CLAUDE.md

@@ -80,6 +80,13 @@ func (t *TableScanManager) WithColumnDetector(detector Detector) *TableScanManag
 	return t
 }
 
+func (t *TableScanManager) ValueCount(table, column string) int {
+	if t == nil || t.valueCount == nil {
+		return 0
+	}
+	return t.valueCount[table][column]
+}
+
 func (t *TableScanManager) Start(ctx context.Context, n int) error {
 	if t.columnDetector == nil {
 		return fmt.Errorf("no detector available")
@@ -154,7 +161,9 @@ func (t *TableScanManager) Output() (_ map[string]TableScannerOutput, err error)
 		}
 	}
 
-	close(t.outputChan)
+	if t.outputChan != nil {
+		close(t.outputChan)
+	}
 
 	return t.output, nil
 }
@@ -235,10 +244,6 @@ func (t *TableScanManager) pushDevidedInput(input ScanInput) (err error) {
 		}
 	}()
 
-	// if t.numbOfWorker.Load() == 0 {
-	// 	return fmt.Errorf("no worker available")
-	// }
-
 	timeout := time.NewTimer(10 * time.Second)
 	defer timeout.Stop()
 
@@ -290,11 +295,6 @@ func (t *TableScanManager) OutputRunner() {
 			fmt.Println("Recovered OutputRunner", r)
 		}
 	}()
-
-	// f, err := os.Create("detailed_output.csv")
-	// if err != nil {
-	// 	fmt.Println("Error creating file", err)
-	// }
 
 	// csvFile := csv.NewWriter(f)
 	for output := range t.outputChan {

@@ -112,7 +112,15 @@ type spacyDetector struct {
 	// the python script and manages the input and output flow between
 	// go code and python script.
 	cmdProcessor *cmdprocessor.CmdProcessor
+
+	// gateOnColumnContext, when true, only runs spaCy for Name/Address columns.
+	// Default is false so consumers (e.g. klouddbshield legacy region) keep
+	// scanning all values. DPDPA CLI enables this in DetectorFactory.
+	gateOnColumnContext bool
 }
+
+// SpacyDetector is the exported spaCy value detector.
+type SpacyDetector = spacyDetector
 
 // NewSpacyDetector returns a new instance of spacyDetector.
 func NewSpacyDetector() *spacyDetector {
@@ -126,6 +134,12 @@ func (u *spacyDetector) Name() string {
 // WithWorkDirs sets the workDirs for the spacyDetector.
 func (u *spacyDetector) WithWorkDirs(workDirs []string) *spacyDetector {
 	u.workDirs = workDirs
+	return u
+}
+
+// WithColumnContextGate enables Name/Address column gating.
+func (u *spacyDetector) WithColumnContextGate(enabled bool) *spacyDetector {
+	u.gateOnColumnContext = enabled
 	return u
 }
 
@@ -261,9 +275,8 @@ func (u *spacyDetector) detectWorkingDir() (string, error) {
 // This will pass the input word to python script and get the
 // PII labels related to the input.
 func (u *spacyDetector) Detect(ctx context.Context, word string, columnContext ColumnContext) ([]PiiLabelWithWeight, error) {
-	// Only run spacy for Name or Address columns — skip all others
-	if columnContext != nil {
-		if !columnContext[PIILabel_Name] && !columnContext[PIILabel_Address] {
+	if u.gateOnColumnContext {
+		if columnContext == nil || (!columnContext[PIILabel_Name] && !columnContext[PIILabel_Address]) {
 			return nil, nil
 		}
 	}

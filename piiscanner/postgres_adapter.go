@@ -1,0 +1,244 @@
+package piiscanner
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/klouddb/dpdpa_pii_db_scanner/pkg/postgresdb"
+	"github.com/klouddb/dpdpa_pii_db_scanner/pkg/utils"
+)
+
+// PostgresAdapter implements DBAdapter for PostgreSQL. It owns the *sql.DB
+// connection privately — nothing outside this file touches database/sql
+// for Postgres anymore.
+type PostgresAdapter struct {
+	cfg    postgresdb.Postgres
+	schema string
+	db     *sql.DB
+}
+
+func NewPostgresAdapter(cfg postgresdb.Postgres, schema string) *PostgresAdapter {
+	if schema == "" {
+		schema = "public"
+	}
+	return &PostgresAdapter{cfg: cfg, schema: schema}
+}
+
+// NewPostgresAdapterFromDB wraps an already-open connection — e.g. one opened
+// directly from a postgres:// URI, where OpenURI intentionally connects with
+// the raw URI string as-is rather than rebuilding it from discrete fields —
+// instead of dialing a fresh one in Connect.
+func NewPostgresAdapterFromDB(db *sql.DB, schema string) *PostgresAdapter {
+	if schema == "" {
+		schema = "public"
+	}
+	return &PostgresAdapter{db: db, schema: schema}
+}
+
+func (a *PostgresAdapter) Schema() string {
+	return a.schema
+}
+
+func (a *PostgresAdapter) Connect(ctx context.Context) error {
+	if a.db != nil {
+		return nil
+	}
+	db, _, err := postgresdb.Open(ctx, a.cfg)
+	if err != nil {
+		return err
+	}
+	a.db = db
+	return nil
+}
+
+func (a *PostgresAdapter) Close() error {
+	if a.db == nil {
+		return nil
+	}
+	return a.db.Close()
+}
+
+func (a *PostgresAdapter) ListTables(ctx context.Context) ([]TableRef, error) {
+	exists, err := utils.SchemaExists(ctx, a.db, a.schema)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, fmt.Errorf("schema %s does not exist", a.schema)
+	}
+
+	names, err := utils.GetListFromQuery(ctx, a.db,
+		"SELECT table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema = '"+a.schema+"'")
+	if err != nil {
+		return nil, err
+	}
+
+	tables := make([]TableRef, len(names))
+	for i, name := range names {
+		tables[i] = TableRef{Schema: a.schema, Name: name}
+	}
+	return tables, nil
+}
+
+func (a *PostgresAdapter) quotedName(table TableRef) string {
+	return fmt.Sprintf("%q.%q", table.Schema, table.Name)
+}
+
+func (a *PostgresAdapter) ListColumns(ctx context.Context, table TableRef) ([]string, error) {
+	stmt, err := a.db.PrepareContext(ctx, fmt.Sprintf(`SELECT * FROM %s LIMIT 0`, a.quotedName(table)))
+	if err != nil {
+		return nil, fmt.Errorf("error preparing statement: %v", err)
+	}
+	defer stmt.Close()
+
+	rows, err := stmt.QueryContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("error executing query: %v", err)
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("error getting columns: %v", err)
+	}
+	return columns, nil
+}
+
+func (a *PostgresAdapter) RowCount(ctx context.Context, table TableRef) (int, error) {
+	return utils.TableRowCount(ctx, a.db, a.quotedName(table))
+}
+
+// DetectRowCursor looks for a single-column, numeric, auto-generated
+// primary key. Composite keys, non-numeric keys, and tables with no primary key all
+// return ok=false, same as a table with no candidate at all.
+func (a *PostgresAdapter) DetectRowCursor(ctx context.Context, table TableRef) (RowCursor, bool, error) {
+	rows, err := a.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT kcu.column_name
+		FROM information_schema.table_constraints tc
+		JOIN information_schema.key_column_usage kcu
+		  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+		WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = '%s' AND tc.table_name = '%s'`,
+		table.Schema, table.Name))
+	if err != nil {
+		return RowCursor{}, false, fmt.Errorf("error listing primary key columns for %s: %v", table.DisplayName(), err)
+	}
+	var pkColumns []string
+	for rows.Next() {
+		var col string
+		if err := rows.Scan(&col); err != nil {
+			rows.Close()
+			return RowCursor{}, false, fmt.Errorf("error scanning primary key column for %s: %v", table.DisplayName(), err)
+		}
+		pkColumns = append(pkColumns, col)
+	}
+	if err := rows.Err(); err != nil {
+		return RowCursor{}, false, err
+	}
+	rows.Close()
+
+	// A composite key (or no key at all) has no single value to compare against a watermark.
+	if len(pkColumns) != 1 {
+		return RowCursor{}, false, nil
+	}
+	pkColumn := pkColumns[0]
+
+	var dataType, isIdentity string
+	var columnDefault sql.NullString
+	err = a.db.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT data_type, is_identity, column_default
+		FROM information_schema.columns
+		WHERE table_schema = '%s' AND table_name = '%s' AND column_name = '%s'`,
+		table.Schema, table.Name, pkColumn)).Scan(&dataType, &isIdentity, &columnDefault)
+	if err != nil {
+		return RowCursor{}, false, fmt.Errorf("error inspecting primary key column %s for %s: %v", pkColumn, table.DisplayName(), err)
+	}
+
+	isNumeric := dataType == "integer" || dataType == "bigint" || dataType == "smallint"
+	isAutoGenerated := isIdentity == "YES" || (columnDefault.Valid && strings.HasPrefix(columnDefault.String, "nextval("))
+	if !isNumeric || !isAutoGenerated {
+		return RowCursor{}, false, nil
+	}
+
+	// MAX() on an indexed primary key is an index-only lookup, not a table
+	// scan — cheap regardless of table size.
+	var maxValue sql.NullInt64
+	err = a.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT MAX("%s") FROM %s`, pkColumn, a.quotedName(table))).Scan(&maxValue)
+	if err != nil {
+		return RowCursor{}, false, fmt.Errorf("error reading max(%s) for %s: %v", pkColumn, table.DisplayName(), err)
+	}
+
+	value := "0"
+	if maxValue.Valid {
+		value = strconv.FormatInt(maxValue.Int64, 10)
+	}
+	return RowCursor{Column: pkColumn, Kind: CursorKind_Numeric, Value: value}, true, nil
+}
+
+func (a *PostgresAdapter) StreamValues(ctx context.Context, table TableRef, columns []string, opts SampleOptions, onRowScanned func(), cb RowCallback) error {
+	quotedTable := a.quotedName(table)
+	quotedColumns := strings.Join(columns, `","`)
+
+	var query string
+	switch {
+	case opts.Mode == SampleMode_Limited:
+		// RowCursor is never set alongside SampleMode_Limited — the
+		// incremental "new rows only" pass only ever runs at DeepScan.
+		query = fmt.Sprintf(`SELECT "%s" FROM %s TABLESAMPLE BERNOULLI (10) REPEATABLE (%d) LIMIT %d`,
+			quotedColumns, quotedTable, opts.Seed, opts.Size)
+	case opts.RowCursor != nil:
+		cursorVal, err := strconv.ParseInt(opts.RowCursor.Value, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid row cursor value %q for %s: %v", opts.RowCursor.Value, opts.RowCursor.Column, err)
+		}
+		query = fmt.Sprintf(`SELECT "%s" FROM %s WHERE "%s" > %d`, quotedColumns, quotedTable, opts.RowCursor.Column, cursorVal)
+	default:
+		query = fmt.Sprintf(`SELECT "%s" FROM %s`, quotedColumns, quotedTable)
+	}
+
+	stmt, err := a.db.PrepareContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("error preparing statement: %v query:(%s)", err, query)
+	}
+	defer stmt.Close()
+
+	rows, err := stmt.QueryContext(ctx)
+	if err != nil {
+		return fmt.Errorf("error executing query: %v", err)
+	}
+	defer rows.Close()
+
+	count := len(columns)
+
+	values := make([]interface{}, count)
+	scanArgs := make([]interface{}, count)
+	for i := range values {
+		scanArgs[i] = &values[i]
+	}
+	for rows.Next() {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if onRowScanned != nil {
+			onRowScanned()
+		}
+
+		if err := rows.Scan(scanArgs...); err != nil {
+			return fmt.Errorf("error scanning row: %v", err)
+		}
+
+		for i := range values {
+			val := GetValuesString(values[i])
+			if val == "" || val == "NULL" || val == "<nil>" {
+				continue
+			}
+			if err := cb(columns[i], val); err != nil {
+				return err
+			}
+		}
+	}
+
+	return rows.Err()
+}

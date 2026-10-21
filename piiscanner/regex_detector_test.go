@@ -57,7 +57,7 @@ func TestRegexDetector(t *testing.T) {
 		{
 			name:     "PAN value",
 			detector: valueDetector,
-			input:    "ABCDE1234F",
+			input:    "ABCAE1234F",
 			want:     PIILabel_PANNumber,
 		},
 		{
@@ -94,13 +94,13 @@ func TestRegexDetector(t *testing.T) {
 		{
 			name:     "India region includes PAN",
 			detector: indiaValueDetector,
-			input:    "ABCDE1234F",
+			input:    "ABCBE1234F",
 			want:     PIILabel_PANNumber,
 		},
 		{
 			name:     "other region excludes PAN",
 			detector: otherRegionValueDetector,
-			input:    "ABCDE1234F",
+			input:    "ABCBE1234F",
 			notWant:  PIILabel_PANNumber,
 		},
 		{

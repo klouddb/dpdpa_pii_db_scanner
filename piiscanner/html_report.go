@@ -22,36 +22,43 @@ type htmlFinding struct {
 }
 
 type htmlReportData struct {
-	Host               string
-	Database           string
-	ScanType           string
-	TableCount         int
-	DataCount          int
-	MetaCount          int
-	LowDataCount       int
-	LowMetaCount       int
-	DataRows           []htmlFinding
-	MetaRows           []htmlFinding
-	LowDataRows        []htmlFinding
-	LowMetaRows        []htmlFinding
-	HasHighFindings    bool
-	HasLowFindings     bool
-	ShowLowConfidence  bool
+	Host              string
+	Engine            string
+	Database          string
+	ScanType          string
+	TableCount        int
+	DataCount         int
+	MetaCount         int
+	LowDataCount      int
+	LowMetaCount      int
+	DataRows          []htmlFinding
+	MetaRows          []htmlFinding
+	LowDataRows       []htmlFinding
+	LowMetaRows       []htmlFinding
+	HasHighFindings   bool
+	HasLowFindings    bool
+	ShowLowConfidence bool
 }
 
-func CreateHTMLReport(i *DatabasePIIScanOutput, cnf Config, host string) {
+func CreateHTMLReport(i *DatabasePIIScanOutput, cnf Config, host, engine, targetDir string) {
 	if !i.HasFindings() {
 		return
 	}
 
-	f, err := os.Create("kshield_pii_report.html")
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		fmt.Println("Error creating output directory:", err)
+		return
+	}
+
+	htmlFilePath := filepath.Join(targetDir, "kshield_pii_report.html")
+	f, err := os.Create(htmlFilePath)
 	if err != nil {
 		fmt.Println("Error creating HTML report:", err)
 		return
 	}
 	defer f.Close()
 
-	data := buildHTMLData(i, cnf, host)
+	data := buildHTMLData(i, cnf, host, engine)
 
 	tmpl, err := template.New("report").Parse(htmlReportTemplate)
 	if err != nil {
@@ -68,7 +75,7 @@ func CreateHTMLReport(i *DatabasePIIScanOutput, cnf Config, host string) {
 	fmt.Println("> HTML report created at: [ " + absPath + " ]")
 }
 
-func buildHTMLData(i *DatabasePIIScanOutput, cnf Config, host string) htmlReportData {
+func buildHTMLData(i *DatabasePIIScanOutput, cnf Config, host string, engine string) htmlReportData {
 	scanType := RunOptionTitleMap[cnf.runOption]
 	if cnf.AutoDetect {
 		scanType = AutoScanTitle
@@ -79,6 +86,7 @@ func buildHTMLData(i *DatabasePIIScanOutput, cnf Config, host string) htmlReport
 
 	data := htmlReportData{
 		Host:              host,
+		Engine:            engine,
 		Database:          cnf.Database,
 		ScanType:          scanType,
 		ShowLowConfidence: cnf.printAllResults,
@@ -183,7 +191,7 @@ const htmlReportTemplate = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Postgres PII Report — {{.Database}}</title>
+<title>{{.Engine}} PII Report — {{.Database}}</title>
 <style>
 :root {
   --kloud-blue: #55a3d7;
@@ -433,11 +441,11 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fo
 </head>
 <body>
 
-<h1>Postgres PII Report</h1>
+<h1>{{.Engine}} PII Report</h1>
 <p class="subtitle">PII results · Scans run via <code>[piiscanner]</code> · <code>dpdpascanner</code></p>
 
 <div class="callout">
-  <span>{{.Host}}:5432 &middot; database <span class="pii-db-badge">{{.Database}}</span> &middot; {{.ScanType}}</span>
+  <span>{{.Host}} &middot; database <span class="pii-db-badge">{{.Database}}</span> &middot; {{.ScanType}}</span>
 </div>
 
 <div class="stats">

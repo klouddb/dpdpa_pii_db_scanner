@@ -12,61 +12,82 @@ import (
 	"github.com/olekukonko/tablewriter"
 )
 
-func PrintTerminalOutput(i *DatabasePIIScanOutput, cnf Config) {
+// OutputOptions carries terminal/log printing flags for shared output helpers.
+// Consumers outside this module (e.g. klouddbshield) should pass this instead of Config.
+type OutputOptions struct {
+	PrintAllResults  bool
+	PrintSummaryOnly bool
+}
+
+// OutputOptions returns printing flags from scanner Config.
+func (c Config) OutputOptions() OutputOptions {
+	return OutputOptions{
+		PrintAllResults:  c.printAllResults,
+		PrintSummaryOnly: c.PrintSummaryOnly,
+	}
+}
+
+func PrintTerminalOutput(i *DatabasePIIScanOutput, opts OutputOptions) {
 	if !i.HasFindings() {
 		fmt.Println("> No PII data found in database")
 		return
 	}
 
-	if cnf.PrintSummaryOnly {
+	if opts.PrintSummaryOnly {
 		printTerminalOutputSimple(i)
 	} else {
-		printTerminalOutputTable(i, cnf)
+		printTerminalOutputTable(i, opts)
 	}
-
 }
 
-func printTerminalOutputTable(i *DatabasePIIScanOutput, cnf Config) {
-	GenerateTabularOutput(os.Stdout, i, cnf, "")
+func printTerminalOutputTable(i *DatabasePIIScanOutput, opts OutputOptions) {
+	GenerateTabularOutput(os.Stdout, i, opts, "")
 }
 
-func CreateTabularOutputfile(i *DatabasePIIScanOutput, cnf Config) {
+func CreateTabularOutputfile(i *DatabasePIIScanOutput, opts OutputOptions, targetDir string) {
 	if !i.HasFindings() {
 		return
 	}
 
-	highConfidenceFile, err := os.Create("kshield_pii_highconfidence.log")
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		fmt.Println("Error creating output directory: ", text.FgRed.Sprint(err))
+		return
+	}
+
+	highConfidencePath := filepath.Join(targetDir, "kshield_pii_highconfidence.log")
+	highConfidenceFile, err := os.Create(highConfidencePath)
 	if err != nil {
 		fmt.Println("Error creating high confidence log file: ", text.FgRed.Sprint(err))
 		return
 	}
 	defer highConfidenceFile.Close()
 
-	GenerateTabularOutput(highConfidenceFile, i, cnf, "High")
+	GenerateTabularOutput(highConfidenceFile, i, opts, "High")
 
 	HighConfidenceFilePath, _ := filepath.Abs(highConfidenceFile.Name())
 	fmt.Println("> High confidence log file created at: [ " + HighConfidenceFilePath + " ]")
 
 	// Low/medium confidence is suppressed by default to reduce noise.
 	// Pass --print-all to also write the low-confidence log.
-	if !cnf.printAllResults {
+	if !opts.PrintAllResults {
 		return
 	}
 
-	lowConfidenceFile, err := os.Create("kshield_pii_lowconfidence.log")
+	lowConfidencePath := filepath.Join(targetDir, "kshield_pii_lowconfidence.log")
+	lowConfidenceFile, err := os.Create(lowConfidencePath)
 	if err != nil {
 		fmt.Println("Error creating low confidence log file: ", text.FgRed.Sprint(err))
 		return
 	}
 	defer lowConfidenceFile.Close()
 
-	GenerateTabularOutput(lowConfidenceFile, i, cnf, "Medium|Low")
+	GenerateTabularOutput(lowConfidenceFile, i, opts, "Medium|Low")
 
 	lowConfidenceFilePath, _ := filepath.Abs(lowConfidenceFile.Name())
 	fmt.Println("> Low confidence log file created at: [ " + lowConfidenceFilePath + " ]")
 }
 
-func GenerateTabularOutput(w io.Writer, i *DatabasePIIScanOutput, cnf Config, filePrint string) {
+func GenerateTabularOutput(w io.Writer, i *DatabasePIIScanOutput, opts OutputOptions, filePrint string) {
 	columnTable := tablewriter.NewWriter(w)
 	headers := []string{"Table", "Column", "Label", "Confidence"}
 	columnTable.SetHeader(headers)
@@ -82,7 +103,7 @@ func GenerateTabularOutput(w io.Writer, i *DatabasePIIScanOutput, cnf Config, fi
 		for columnName, piidatas := range columns {
 			for _, piidata := range piidatas {
 				tablesWithPIIData.Add(tablename)
-				if filePrint == "" && !cnf.printAllResults && piidata.Confidence != "High" {
+				if filePrint == "" && !opts.PrintAllResults && piidata.Confidence != "High" {
 					continue
 				} else if filePrint != "" && !strings.Contains(filePrint, piidata.Confidence) {
 					continue
@@ -102,7 +123,7 @@ func GenerateTabularOutput(w io.Writer, i *DatabasePIIScanOutput, cnf Config, fi
 
 				tableShowingInTopTable.Add(tablename)
 
-				if filePrint == "" && !cnf.printAllResults {
+				if filePrint == "" && !opts.PrintAllResults {
 					continue
 				}
 			}
@@ -164,7 +185,6 @@ func printTerminalOutputSimple(i *DatabasePIIScanOutput) {
 		return
 	}
 
-	// var renderValueTable, renderColumnTable bool
 	m := map[string] /* table name */ map[string] /* confidence */ map[string] /* detector */ []string{}
 	for tablename, columns := range i.Data {
 		m[tablename] = map[string]map[string][]string{}
@@ -186,7 +206,6 @@ func printTerminalOutputSimple(i *DatabasePIIScanOutput) {
 
 	fmt.Println()
 	headerPrinted := false
-	// print all tables with high confidence
 	for tablename, confidences := range m {
 		if _, ok := confidences["High"]; ok {
 			if !headerPrinted {
@@ -195,7 +214,6 @@ func printTerminalOutputSimple(i *DatabasePIIScanOutput) {
 			}
 			fmt.Printf("%s \n", text.FgHiRed.Sprint(tablename))
 			for detector, columns := range confidences["High"] {
-				// fmt.Printf("-> %s (%d column): \n    - %s\n", detector, len(columns), strings.Join(columns, "\n    - "))
 				fmt.Printf("-> %s (%d column): %s\n", detector, len(columns), utils.AraryToHumanReadableString(columns))
 			}
 		}

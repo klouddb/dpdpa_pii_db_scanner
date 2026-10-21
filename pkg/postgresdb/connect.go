@@ -1,9 +1,11 @@
 package postgresdb
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	_ "github.com/lib/pq"
 	"github.com/rs/zerolog/log"
@@ -70,23 +72,26 @@ func formatConnectionParameter(key, value string) string {
 	return key + "='" + escaped + "'"
 }
 
-func Open(conf Postgres) (*sql.DB, string, error) {
+func Open(ctx context.Context, conf Postgres) (*sql.DB, string, error) {
 	if err := validateSSLMode(conf.SSLmode); err != nil {
 		return nil, "", err
 	}
-
 	url := BuildConnectionString(conf)
 
-	db, err := ConnectDatabaseUsingConnectionString(url, conf.PingCheck)
+	db, err := ConnectDatabaseUsingConnectionString(url, false) // pingCheck now done below
 	if err != nil {
-		return nil, "", fmt.Errorf(
-			"connect to PostgreSQL host=%q port=%q database=%q user=%q: %w",
-			conf.Host,
-			conf.Port,
-			conf.DBName,
-			conf.User,
-			err,
-		)
+		return nil, "", fmt.Errorf("connect to PostgreSQL host=%q port=%q database=%q user=%q: %w",
+			conf.Host, conf.Port, conf.DBName, conf.User, err)
+	}
+
+	if conf.PingCheck {
+		pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := db.PingContext(pingCtx); err != nil {
+			db.Close()
+			return nil, "", fmt.Errorf("connect to PostgreSQL host=%q port=%q database=%q user=%q: %w",
+				conf.Host, conf.Port, conf.DBName, conf.User, err)
+		}
 	}
 	if conf.MaxIdleConn > 0 {
 		db.SetMaxIdleConns(conf.MaxIdleConn)

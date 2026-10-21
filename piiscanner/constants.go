@@ -5,12 +5,14 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"strings"
+
 	"github.com/klouddb/dpdpa_pii_db_scanner/pkg/utils"
 )
 
 var (
 	ignoreRegexes = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)^(created|updated|deleted|committed)_(at|by|on)$`),
+		regexp.MustCompile(`(?i)^(created|updated|deleted|committed)[\s_-]?(at|by|on)$`),
 		// regexp.MustCompile(`(?i)_id$`), // this is failing. here we need to all _id accept email_id
 		regexp.MustCompile(`(?i)^.*timestamp.*$`),
 		regexp.MustCompile(`(?i)^(created|updated|modified|deleted|committed|inserted|last_modified|expiry|expiration|effective|issue|invoice|payment)_date$`),
@@ -23,6 +25,15 @@ var (
 )
 
 type RunOption int
+
+func (r RunOption) String() string {
+	for k, v := range RunOptionMap {
+		if v == r {
+			return k
+		}
+	}
+	return ""
+}
 
 type DetectorType string
 
@@ -57,9 +68,16 @@ const (
 	AUTO_SCAN_ROW_THRESHOLD      = 10000
 	DATASCAN_SAMPLE_SEED         = 47
 
+	// Depth level strings used to record and compare scan depth in state files.
+	Depth_DataScan = RunOption_DataScan_String // "datascan"
+	Depth_DeepScan = RunOption_DeepScan_String // "deepscan"
+
 	DetectorType_ColumnDetector DetectorType = "column detector"
 	DetectorType_ValueDetector  DetectorType = "value detector"
 )
+
+// SpacyWorkDirs is the shared search path for python/spacy_runner.py.
+var SpacyWorkDirs = []string{"python", "/etc/klouddbshield/python", "../../python"}
 
 var OrderMap = map[string]int{
 	// for detector type
@@ -143,6 +161,8 @@ func FilterColumns(columns []string) []string {
 }
 
 func IgnoreColumn(column string) bool {
+	column = strings.ToLower(column)
+
 	if column == "email_id" {
 		return false
 	}

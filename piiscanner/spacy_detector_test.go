@@ -59,6 +59,17 @@ func TestSpacyDetectorDetectWorkingDir(t *testing.T) {
 	}
 }
 
+func TestWithColumnContextGate(t *testing.T) {
+	detector := NewSpacyDetector()
+	if detector.gateOnColumnContext {
+		t.Fatal("gate should be off by default")
+	}
+	detector = detector.WithColumnContextGate(true)
+	if !detector.gateOnColumnContext {
+		t.Fatal("gate should be on after WithColumnContextGate(true)")
+	}
+}
+
 func createSpacyTestDir(t *testing.T) string {
 	t.Helper()
 
