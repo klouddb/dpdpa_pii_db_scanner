@@ -256,43 +256,6 @@ With `--print-all`, the low-confidence log line is also printed. If nothing was 
 
 ---
 
-## Library usage (Go consumers)
-
-Import the `piiscanner` package to reuse India DPDP detection (column + value regexes, column-context gates, checksums) without running the CLI:
-
-```go
-import (
-	"context"
-
-	"github.com/klouddb/dpdpa_pii_db_scanner/piiscanner"
-)
-
-func example() {
-	col := piiscanner.NewIndiaColumnDetector()
-	val := piiscanner.NewIndiaValueDetector()
-	_ = col.Init()
-	_ = val.Init()
-
-	ctx := context.Background()
-	columnLabels, _ := col.Detect(ctx, "pan_number", nil)
-	columnContext := make(piiscanner.ColumnContext)
-	for _, l := range columnLabels {
-		columnContext[l.PIILabel] = true
-	}
-
-	// Pass columnContext so RequiresColumnContext entities (CVV, cheque, etc.) activate.
-	valueLabels, _ := val.Detect(ctx, "ABCDE1234F", columnContext)
-	_ = valueLabels
-
-	// Policy helpers for scoring / Phase-2 fallbacks (stay correct when new entities are added):
-	_ = piiscanner.IsWeightMergeEntity(piiscanner.PIILabel_PANNumber)
-	_ = piiscanner.MergeIndiaValueWeight(string(piiscanner.PIILabel_PANNumber), 1.0, 0.3)
-	_, _ = piiscanner.RunIndiaUnrecognizedColumnFallbacks(ctx, nil, true, nil)
-}
-```
-
-Bump the module version in your consumer to pick up new India entities and column rules without copying detector code.
-
 ---
 
 ## Troubleshooting
