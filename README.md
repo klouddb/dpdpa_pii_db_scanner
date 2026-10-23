@@ -239,20 +239,7 @@ With `--print-all`, the low-confidence log line is also printed. If nothing was 
 ./dpdpascanner --print-summary --database hr_db
 ```
 
-## Project layout
 
-```
-.
-├── cmd/main.go          — CLI entry point, flags, per-instance dispatch
-├── piiscanner/          — scan engine: adapters, detectors, reporting, incremental state
-├── pkg/
-│   ├── postgresdb/, mysqldb/, sqlserverdb/, mongodb/, redisdb/  — per-engine DB clients
-│   ├── cmd_processor/   — manages the spaCy subprocess
-│   └── utils/
-├── python/spacy_runner.py — spaCy NER worker used by --piiscanner spacyscan
-├── conf.example.toml    — copy to config.toml
-└── scan_state/          — incremental scan state (generated at runtime)
-```
 
 ---
 
