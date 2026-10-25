@@ -2,7 +2,7 @@
 
 [![Go Build](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/release.yml/badge.svg)](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/release.yml) [![Go Lint](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/golangci.yml/badge.svg)](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/golangci.yml) [![Govulncheck](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/govulncheck.yml/badge.svg)](https://github.com/klouddb/dpdpa_pii_db_scanner/actions/workflows/govulncheck.yml)
 
-A command-line PII scanner built for compliance with India's **Digital Personal Data Protection (DPDP) Act 2023**.
+A command-line PII scanner built for compliance with India's **Digital Personal Data Protection (DPDP) Act**.
 
 Point it at a database — PostgreSQL, MySQL, SQL Server, MongoDB, or Redis — and it scans every table (or collection/key) for sensitive data: Aadhaar, PAN, GSTIN, bank accounts, credit cards, passports, UPI IDs, and 40+ other entity types. Results show up in your terminal, in log files, and in a self-contained HTML report.
 
