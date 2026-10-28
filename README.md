@@ -6,22 +6,7 @@ A command-line PII scanner built for compliance with India's **Digital Personal 
 
 Point it at a database — PostgreSQL, MySQL, SQL Server, MongoDB, or Redis — and it scans every table (or collection/key) for sensitive data: Aadhaar, PAN, GSTIN, bank accounts, credit cards, passports, UPI IDs, and 40+ other entity types. Results show up in your terminal, in log files, and in a self-contained HTML report.
 
-## What you get
-
-- **Terminal output** — high-confidence findings by default; add `--print-all` for medium/low confidence too
-- **HTML report** (`kshield_pii_report.html`) — same findings, browsable, no internet needed to open it
-- **Log files** — `kshield_pii_highconfidence.log` always; `kshield_pii_lowconfidence.log` with `--print-all`
-- **Multi-instance scanning** — any mix of servers, engines, and databases in one run via `config.toml`
-- **Incremental scans** — re-run later and only scan what's new or under-scanned (`--incremental`)
-
-Each table is scanned two ways: a **meta scan** (column names only, e.g. a column called `aadhaar_number`) and a **data scan** (actual values checked against 40+ regex patterns). By default the scanner picks the right depth automatically per table — see [Scan modes](#scan-modes) below.
-
-## Prerequisites
-
-- Go 1.26 or newer (to build)
-- Git
-- One of: PostgreSQL, MySQL, SQL Server, MongoDB, or Redis
-- Optional, only for `--piiscanner spacyscan`: Python 3 with spaCy installed
+ Try KloudDB Shield to enhance your overall database security posture and simplify your journey toward DPDPA compliance  https://kshielddocs.vercel.app/docs/dpdpa-compliance
 
 ## Getting started
 
