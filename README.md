@@ -231,4 +231,6 @@ With `--print-all`, the low-confidence log line is also printed. If nothing was 
 ./dpdpascanner --print-summary --database hr_db
 ```
 
+## Copyright
 
+Copyright (c) 2024-2026, KloudDB.
