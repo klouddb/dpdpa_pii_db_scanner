@@ -4,7 +4,7 @@
 
 A command-line PII scanner built for compliance with India's **Digital Personal Data Protection (DPDP) Act**.
 
-Point it at a database — 
+
 <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/postgresql/postgresql-original.svg" width="18" height="18"/> PostgreSQL,
 <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/mysql/mysql-original.svg" width="18" height="18"/> MySQL,
 <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/microsoftsqlserver/microsoftsqlserver-plain.svg" width="18" height="18"/> SQL Server,
