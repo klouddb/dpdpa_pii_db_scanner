@@ -4,7 +4,14 @@
 
 A command-line PII scanner built for compliance with India's **Digital Personal Data Protection (DPDP) Act**.
 
-Point it at a database — PostgreSQL, MySQL, SQL Server, MongoDB, or Redis — and it scans every table (or collection/key) for sensitive data: Aadhaar, PAN, GSTIN, bank accounts, credit cards, passports, UPI IDs, and 40+ other entity types. Results show up in your terminal, in log files, and in a self-contained HTML report.
+Point it at a database — 
+<img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/postgresql/postgresql-original.svg" width="18" height="18"/> PostgreSQL,
+<img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/mysql/mysql-original.svg" width="18" height="18"/> MySQL,
+<img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/microsoftsqlserver/microsoftsqlserver-plain.svg" width="18" height="18"/> SQL Server,
+<img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/mongodb/mongodb-original.svg" width="18" height="18"/> MongoDB,
+or
+<img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" width="18" height="18"/> Redis —
+and it scans every table (or collection/key) for sensitive data.: Aadhaar, PAN, GSTIN, bank accounts, credit cards, passports, UPI IDs, and 40+ other entity types. Results show up in your terminal, in log files, and in a self-contained HTML report.
 
  Try KloudDB Shield to enhance your overall database security posture and simplify your journey toward DPDPA compliance  https://kshielddocs.vercel.app/docs/dpdpa-compliance
 
